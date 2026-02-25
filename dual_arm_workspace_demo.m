@@ -69,7 +69,7 @@ if min(reachPair) < 0.05
 end
 
 [pAnchL,pAnchR] = generateAnchors(wsCenter,opts.WorkspaceSize,opts.Seed);
-[tGrid,pL,pR] = makeDifferentTrajectories(pAnchL,pAnchR,opts.N);
+[tIK,pL,pR] = makeDifferentTrajectories(pAnchL,pAnchR,opts.N_IK);
 
 [shoulderName, elbowName] = pickShoulderElbow(robot);
 ikObj = inverseKinematics('RigidBodyTree',robot);
@@ -78,23 +78,23 @@ weights = [1 1 1 1e-3 1e-3 1e-3];
 best = struct('ok',false,'score',inf,'qL',[],'qR',[],'eeL',[],'eeR',[]);
 for attempt = 1:opts.MaxAttempts
     failStats.attempts = attempt;
-    [qL,okL,eL,stL] = solveTrajIK(robot,ikObj,eeName,pL,TL,qHome,weights,shoulderName,elbowName,-1,opts.ElbowOutWeight);
-    [qR,okR,eR,stR] = solveTrajIK(robot,ikObj,eeName,pR,TR,qHome,weights,shoulderName,elbowName,+1,opts.ElbowOutWeight);
+    [qL,okL,eL,stL] = solveTrajIK(robot,ikObj,eeName,pL,TL,qHome,weights,shoulderName,elbowName,-1,opts.ElbowOutWeight,opts,strcmpi(opts.Mode,'bootstrap') && opts.Fast);
+    [qR,okR,eR,stR] = solveTrajIK(robot,ikObj,eeName,pR,TR,qHome,weights,shoulderName,elbowName,+1,opts.ElbowOutWeight,opts,strcmpi(opts.Mode,'bootstrap') && opts.Fast);
 
     if ~(okL && okR)
         failStats.ikFail = failStats.ikFail + 1;
         if strcmpi(opts.Mode,'bootstrap')
             [pAnchL,pAnchR] = generateAnchors(wsCenter,opts.WorkspaceSize,opts.Seed+attempt);
-            [~,pL,pR] = makeDifferentTrajectories(pAnchL,pAnchR,opts.N);
+            [~,pL,pR] = makeDifferentTrajectories(pAnchL,pAnchR,opts.N_IK);
         end
         continue;
     end
 
-    [isCol,colMin] = detectArmArmCollision(robot,qL,qR,TL,TR,opts.CollisionMargin,eeName);
+    [isCol,colMin] = detectArmArmCollision(robot,qL,qR,TL,TR,opts.CollisionMargin,eeName,opts,strcmpi(opts.Mode,'bootstrap') && opts.Fast);
     if isCol
         failStats.collision = failStats.collision + 1;
         [pAnchL,pAnchR] = generateAnchors(wsCenter,opts.WorkspaceSize,opts.Seed+attempt+17);
-        [~,pL,pR] = makeDifferentTrajectories(pAnchL,pAnchR,opts.N);
+        [~,pL,pR] = makeDifferentTrajectories(pAnchL,pAnchR,opts.N_IK);
         continue;
     end
 
@@ -111,7 +111,7 @@ for attempt = 1:opts.MaxAttempts
 end
 
 out.failStats = failStats;
-out.scenario = struct('baseL',opts.BaseL,'baseR',opts.BaseR,'workspaceCenter',wsCenter,'workspaceSize',opts.WorkspaceSize,'reachability',reachPair,'eeFrame',eeName,'time',tGrid);
+out.scenario = struct('baseL',opts.BaseL,'baseR',opts.BaseR,'workspaceCenter',wsCenter,'workspaceSize',opts.WorkspaceSize,'reachability',reachPair,'eeFrame',eeName,'timeIK',tIK);
 
 if ~best.ok
     fprintf('[dual_arm_demo] Seed=%d ws=[%.3f %.3f %.3f] baseL=[%.2f %.2f %.2f] baseR=[%.2f %.2f %.2f] reach=%.2f/%.2f success=0\n',...
@@ -122,16 +122,18 @@ if ~best.ok
 end
 
 out.success = true;
-out.qL = best.qL;
-out.qR = best.qR;
-out.eeL = best.eeL;
-out.eeR = best.eeR;
+[qLVis,qRVis,eeLVis,eeRVis,tVis] = upsampleForVisualization(best.qL,best.qR,best.eeL,best.eeR,opts.N_Vis);
+out.qL = qLVis;
+out.qR = qRVis;
+out.eeL = eeLVis;
+out.eeR = eeRVis;
+out.scenario.timeVis = tVis;
 
 fprintf('[dual_arm_demo] Seed=%d ws=[%.3f %.3f %.3f] baseL=[%.2f %.2f %.2f] baseR=[%.2f %.2f %.2f] reach=%.2f/%.2f success=1\n',...
     opts.Seed,opts.WorkspaceSize,opts.BaseL,opts.BaseR,reachPair(1),reachPair(2));
 
 if opts.Visualize
-    visualizeDual(robot,best.qL,best.qR,best.eeL,best.eeR,TL,TR,wsCenter,opts.WorkspaceSize,eeName);
+    visualizeDual(robot,qLVis,qRVis,eeLVis,eeRVis,TL,TR,wsCenter,opts.WorkspaceSize,eeName);
 end
 end
 
@@ -150,12 +152,26 @@ addParameter(p,'ElbowOutWeight',0.2);
 addParameter(p,'MaxAttempts',25);
 addParameter(p,'Visualize',true);
 addParameter(p,'Verbose',true);
+addParameter(p,'Fast',true);
+addParameter(p,'IKStride',2);
+addParameter(p,'N_IK',40);
+addParameter(p,'N_Vis',120);
 parse(p,varargin{:});
 opts = p.Results;
 end
 
 function [center, reachPair, failStats] = bootstrapCenter(robot,eeName,qHome,TL,TR,center0,opts,failStats)
-reachPair = coarseReachability(robot,eeName,qHome,TL,TR,center0,opts,20);
+if strcmpi(opts.Mode,'bootstrap') && opts.Fast
+    initSamples = 10;
+    scanSamples = 8;
+    maxScanCount = 6;
+else
+    initSamples = 20;
+    scanSamples = 14;
+    maxScanCount = 12;
+end
+
+reachPair = coarseReachability(robot,eeName,qHome,TL,TR,center0,opts,initSamples);
 center = center0;
 if min(reachPair) >= 0.05
     return;
@@ -173,11 +189,11 @@ bestCenter = baseCenter;
 scanCount = 0;
 for iy = 1:numel(yOffsets)
     for iz = 1:numel(zOffsets)
-        if scanCount >= 12
+        if scanCount >= maxScanCount
             break;
         end
         c = baseCenter + [0 yOffsets(iy) zOffsets(iz)];
-        r = coarseReachability(robot,eeName,qHome,TL,TR,c,opts,14);
+        r = coarseReachability(robot,eeName,qHome,TL,TR,c,opts,scanSamples);
         sc = min(r) + 0.2*sum(r);
         scanCount = scanCount + 1;
         if sc > bestScore
@@ -261,7 +277,7 @@ shoulder = robot.BodyNames{min(2,n)};
 elbow = robot.BodyNames{min(4,n)};
 end
 
-function [qTraj,ok,eeTraj,stats] = solveTrajIK(robot,ikObj,eeName,pWorld,Tbase,qInit,weights,shoulder,elbow,sideSign,elbowW)
+function [qTraj,ok,eeTraj,stats] = solveTrajIK(robot,ikObj,eeName,pWorld,Tbase,qInit,weights,shoulder,elbow,sideSign,elbowW,opts,isFastBootstrap)
 N = size(pWorld,1);
 qTraj = zeros(N,numel(qInit));
 eeTraj = zeros(N,3);
@@ -271,7 +287,7 @@ err = zeros(N,1);
 for k = 1:N
     pLocal = worldToLocal(Tbase,pWorld(k,:));
     Tgoal = trvec2tform(pLocal);
-    [qBest,eBest] = ikMultiStart(robot,ikObj,eeName,Tgoal,weights,qPrev,qInit,shoulder,elbow,sideSign,elbowW,Tbase);
+    [qBest,eBest] = ikMultiStart(robot,ikObj,eeName,Tgoal,weights,qPrev,qInit,shoulder,elbow,sideSign,elbowW,Tbase,opts,k,isFastBootstrap);
     qTraj(k,:) = qBest;
     qPrev = qBest;
     err(k) = eBest;
@@ -284,18 +300,31 @@ ok = ikOk;
 stats = struct('meanPosErr',mean(err),'maxPosErr',max(err));
 end
 
-function [qBest,eBest] = ikMultiStart(robot,ikObj,eeName,Tgoal,weights,qPrev,qHome,shoulder,elbow,sideSign,elbowW,Tbase)
-seeds = [qPrev; qHome; qHome + 0.15*randn(1,numel(qHome))];
+function [qBest,eBest] = ikMultiStart(robot,ikObj,eeName,Tgoal,weights,qPrev,qHome,shoulder,elbow,sideSign,elbowW,Tbase,opts,stepIdx,isFastBootstrap)
+if isFastBootstrap
+    seeds = [qPrev; qHome];
+else
+    seeds = [qPrev; qHome; qHome + 0.15*randn(1,numel(qHome))];
+end
 qBest = qPrev;
 eBest = inf;
 for i = 1:size(seeds,1)
     [qCand,info] = ikObj(eeName,Tgoal,weights,seeds(i,:));
     pErr = info.PoseErrorNorm;
-    eScore = pErr + elbowW * elbowOutPenalty(robot,qCand,shoulder,elbow,sideSign,Tbase);
-    if pErr > 4e-2
+    applyElbowPenalty = mod(stepIdx-1,max(1,opts.IKStride)) == 0;
+    if applyElbowPenalty
+        eScore = pErr + elbowW * elbowOutPenalty(robot,qCand,shoulder,elbow,sideSign,Tbase);
+    else
+        eScore = pErr;
+    end
+    if (~isFastBootstrap) && pErr > 4e-2
         [qCand2,info2] = ikObj(eeName,Tgoal,[1 1 1 1e-4 1e-4 1e-4],qCand);
         pErr2 = info2.PoseErrorNorm;
-        eScore2 = pErr2 + elbowW * elbowOutPenalty(robot,qCand2,shoulder,elbow,sideSign,Tbase);
+        if applyElbowPenalty
+            eScore2 = pErr2 + elbowW * elbowOutPenalty(robot,qCand2,shoulder,elbow,sideSign,Tbase);
+        else
+            eScore2 = pErr2;
+        end
         if eScore2 < eScore
             qCand = qCand2;
             pErr = pErr2;
@@ -317,17 +346,23 @@ want = sideSign * local(2);
 pen = max(0,-want);
 end
 
-function [isCol,minDist] = detectArmArmCollision(robot,qL,qR,TL,TR,margin,eeName)
+function [isCol,minDist] = detectArmArmCollision(robot,qL,qR,TL,TR,margin,eeName,opts,isFastBootstrap)
 N = size(qL,1);
 bodyNames = robot.BodyNames;
-idx = 1:min(numel(bodyNames),6);
+if isFastBootstrap
+    idx = 1:min(numel(bodyNames),4);
+    broadThresh = 0.75;
+else
+    idx = 1:min(numel(bodyNames),6);
+    broadThresh = 0.85;
+end
 radius = linspace(0.07,0.045,numel(idx));
 minDist = inf;
 isCol = false;
-for k = 1:N
+for k = 1:max(1,opts.IKStride):N
     pEeL = worldPos(robot,qL(k,:),eeName,TL);
     pEeR = worldPos(robot,qR(k,:),eeName,TR);
-    if norm(pEeL - pEeR) > 0.85
+    if norm(pEeL - pEeR) > broadThresh
         continue;
     end
     ptsL = chainPoints(robot,qL(k,:),TL,bodyNames(idx));
@@ -345,6 +380,16 @@ for k = 1:N
     end
 end
 if isinf(minDist), minDist = 1.0; end
+end
+
+function [qLVis,qRVis,eeLVis,eeRVis,tVis] = upsampleForVisualization(qL,qR,eeL,eeR,NVis)
+N = size(qL,1);
+tIn = linspace(0,1,N).';
+tVis = linspace(0,1,max(NVis,N)).';
+qLVis = interp1(tIn,qL,tVis,'linear');
+qRVis = interp1(tIn,qR,tVis,'linear');
+eeLVis = interp1(tIn,eeL,tVis,'pchip');
+eeRVis = interp1(tIn,eeR,tVis,'pchip');
 end
 
 function pts = chainPoints(robot,q,Tbase,names)
