@@ -65,6 +65,12 @@ else
     broadMargin = 0.12;
 end
 
+if mode == "strict"
+    ikScore = struct('Wpos',18.0,'Wcont',0.03,'Welbow',0.80,'Wmid',0.05,'Wlim',0.20,'OutMargin',0.03,'MidMargin',0.02);
+else
+    ikScore = struct('Wpos',18.0,'Wcont',0.03,'Welbow',0.30,'Wmid',0.05,'Wlim',0.20,'OutMargin',0.02,'MidMargin',0.01);
+end
+
 numEvalTraj = getOpt(opts, "NumEvalTraj", 0);
 
 %% -------------------------- path / load --------------------------
@@ -141,8 +147,8 @@ end
 %% -------------------- quick IK residual probe --------------------
 pProbeL = centerSel + [-0.12, -0.02, 0.00];
 pProbeR = centerSel + [+0.12, +0.02, 0.00];
-[qProbeL, okProbeL, infoProbeL] = solveIKPoint(robotL, ikL, eeL, pProbeL, qHome, qHome, -1, shL, elL, elbowOutSoftW);
-[qProbeR, okProbeR, infoProbeR] = solveIKPoint(robotR, ikR, eeR, pProbeR, qHome, qHome, +1, shR, elR, elbowOutSoftW);
+[qProbeL, okProbeL, infoProbeL] = solveIKPoint(robotL, ikL, eeL, pProbeL, qHome, qHome, -1, shL, elL, ikScore);
+[qProbeR, okProbeR, infoProbeR] = solveIKPoint(robotR, ikR, eeR, pProbeR, qHome, qHome, +1, shR, elR, ikScore);
 if verbose
     fprintf("  Probe IK: L ok=%d residual=%.4f | R ok=%d residual=%.4f\n", okProbeL, infoProbeL.PosErr, okProbeR, infoProbeR.PosErr);
 end
@@ -172,8 +178,8 @@ for attempt = 1:maxTrajAttempts
         continue;
     end
 
-    [Q1c, stL] = solveTrajectorySequence(robotL, ikL, eeL, P1c, qHome, qAL, -1, shL, elL, elbowOutSoftW);
-    [Q2c, stR] = solveTrajectorySequence(robotR, ikR, eeR, P2c, qHome, qAR, +1, shR, elR, elbowOutSoftW);
+    [Q1c, stL] = solveTrajectorySequence(robotL, ikL, eeL, P1c, qHome, qAL, -1, shL, elL, ikScore);
+    [Q2c, stR] = solveTrajectorySequence(robotR, ikR, eeR, P2c, qHome, qAR, +1, shR, elR, ikScore);
 
     if stL.SuccessRate < 0.80 || stR.SuccessRate < 0.80
         if verbose && mod(attempt,8)==0
@@ -214,6 +220,13 @@ if verbose
     fprintf("\n[success] IK L/R = %.1f%% / %.1f%% | elbow keep L/R = %.1f%% / %.1f%%\n", ...
         100*finalDiag.IKLeft.SuccessRate, 100*finalDiag.IKRight.SuccessRate, ...
         100*finalDiag.ElbowLeft.KeepRatio, 100*finalDiag.ElbowRight.KeepRatio);
+    fprintf("  IK diag L: mean/max posErr=%.4f/%.4f | outward keep=%.1f%% | branchSeed picks=%d\n", ...
+        finalDiag.IKLeft.MeanResidual, finalDiag.IKLeft.MaxResidual, 100*finalDiag.IKLeft.OutwardKeepRatio, finalDiag.IKLeft.SeedTypeCounts.outward);
+    fprintf("  IK diag R: mean/max posErr=%.4f/%.4f | outward keep=%.1f%% | branchSeed picks=%d\n", ...
+        finalDiag.IKRight.MeanResidual, finalDiag.IKRight.MaxResidual, 100*finalDiag.IKRight.OutwardKeepRatio, finalDiag.IKRight.SeedTypeCounts.outward);
+    fprintf("  IK fail causes L(pos/limit/ik)=%d/%d/%d, R=%d/%d/%d\n", ...
+        finalDiag.IKLeft.FailCounts.PosErr, finalDiag.IKLeft.FailCounts.JointLimit, finalDiag.IKLeft.FailCounts.IK, ...
+        finalDiag.IKRight.FailCounts.PosErr, finalDiag.IKRight.FailCounts.JointLimit, finalDiag.IKRight.FailCounts.IK);
 end
 
 if numEvalTraj > 0
@@ -309,12 +322,13 @@ function [ratio, meanResidual] = coarseReachScore(robot,ik,eeName,qHome,center,a
 okN = 0;
 res = nan(samples,1);
 qPrev = qHome;
+ikScore = struct('Wpos',18.0,'Wcont',0.03,'Welbow',0.15,'Wmid',0.03,'Wlim',0.12,'OutMargin',0.01,'MidMargin',0.005);
 for i = 1:samples
     p = samplePointInEllipsoid(center, abc, 0.65);
     p(1) = sideSign*max(abs(p(1)), xKeep);
     p(2) = max(p(2), center(2)-backMargin);
     p(3) = min(max(p(3), center(3)-zRangeHalf), center(3)+zRangeHalf);
-    [q, ok, info] = solveIKPoint(robot,ik,eeName,p,qPrev,qHome,sideSign,'','',0.0);
+    [q, ok, info] = solveIKPoint(robot,ik,eeName,p,qPrev,qHome,sideSign,'','',ikScore);
     if ok
         okN = okN + 1;
         qPrev = q;
@@ -333,6 +347,7 @@ samples = getOpt(opt,"Samples",60);
 needed = getOpt(opt,"Needed",3);
 xKeep = getOpt(opt,"XKeep",0.09);
 elbowW = getOpt(opt,"ElbowOutSoftW",0.3);
+ikScore = struct('Wpos',18.0,'Wcont',0.03,'Welbow',elbowW,'Wmid',0.05,'Wlim',0.15,'OutMargin',0.02,'MidMargin',0.01);
 
 anchors = {};
 anchorQ = {};
@@ -346,8 +361,8 @@ for i = 1:samples
     p(3) = min(max(p(3), center(3)-zRangeHalf), center(3)+zRangeHalf);
 
     seedAlt = perturbSeed(qPrev, 0.16);
-    [q1, ok1, info1] = solveIKPoint(robot,ik,eeName,p,qPrev,qHome,sideSign,shBody,elBody,elbowW);
-    [q2, ok2, info2] = solveIKPoint(robot,ik,eeName,p,seedAlt,qHome,sideSign,shBody,elBody,elbowW);
+    [q1, ok1, info1] = solveIKPoint(robot,ik,eeName,p,qPrev,qHome,sideSign,shBody,elBody,ikScore);
+    [q2, ok2, info2] = solveIKPoint(robot,ik,eeName,p,seedAlt,qHome,sideSign,shBody,elBody,ikScore);
 
     q = q1; ok = ok1; info = info1;
     if ok2 && (~ok1 || info2.Score < info1.Score)
@@ -378,20 +393,30 @@ else
 end
 end
 
-function [q, ok, info] = solveIKPoint(robot,ik,eeName,pGoal,qSeed,qRef,sideSign,shBody,elBody,elbowOutSoftW)
+function [q, ok, info] = solveIKPoint(robot,ik,eeName,pGoal,qSeed,qRef,sideSign,shBody,elBody,ikScore)
 % Success-first IK point solver:
 % - position-priority IK
-% - mild soft elbow-out penalty (can be zero)
+% - multi-start branch bias (soft)
 
 Tgoal = [eye(3), pGoal(:); 0 0 0 1];
-seedPool = {qSeed, qRef, perturbSeed(qSeed,0.20)};
+seedPool = { ...
+    struct('q',qSeed,'type',"prev"), ...
+    struct('q',qRef,'type',"home"), ...
+    struct('q',perturbSeed(qSeed,0.18),'type',"perturbPrev"), ...
+    struct('q',perturbSeed(qRef,0.14),'type',"perturbHome"), ...
+    struct('q',makeOutwardSeed(qSeed,sideSign),'type',"outward") ...
+    };
 
 bestScore = inf;
 bestQ = qSeed;
 bestErr = inf;
+bestOut = -inf;
+bestSeedType = "none";
+bestFail = "ikFail";
 
 for i = 1:numel(seedPool)
-    q0 = seedPool{i};
+    q0 = seedPool{i}.q;
+    seedType = seedPool{i}.type;
     [qCand, solved] = solveSingleIK(robot,ik,eeName,Tgoal,q0);
     if ~solved || any(~isfinite(qCand))
         continue;
@@ -401,43 +426,65 @@ for i = 1:numel(seedPool)
     posErr = norm(Tcur(1:3,4).' - pGoal, 2);
 
     elbowPenalty = 0;
+    outMetric = 0;
     if ~isempty(shBody) && ~isempty(elBody)
         [elLocal, elCenter] = elbowOutScalars(robot,qCand,shBody,elBody,sideSign);
-        elbowPenalty = softplus(0.006-elLocal,35) + 0.8*softplus(0.008-elCenter,30);
+        outMetric = 0.6*elLocal + 0.4*elCenter;
+        elbowPenalty = softplus(ikScore.OutMargin-elLocal,35) + 0.8*softplus(ikScore.OutMargin-elCenter,30);
     end
 
-    score = 18*posErr + elbowOutSoftW*elbowPenalty + 0.03*norm(qCand-qRef)^2;
+    eeX = Tcur(1,4);
+    midlinePenalty = softplus(ikScore.MidMargin - sideSign*eeX, 28);
+    qCont = norm(qCand-qSeed)^2;
+    qBias = norm(qCand-qRef)^2;
+    limPenalty = jointLimitPenalty(robot,qCand);
+
+    score = ikScore.Wpos*posErr + ikScore.Wcont*qCont + ikScore.Welbow*elbowPenalty + ikScore.Wmid*midlinePenalty + ikScore.Wlim*limPenalty + 0.02*qBias;
 
     if score < bestScore
         bestScore = score;
         bestQ = qCand;
         bestErr = posErr;
+        bestOut = outMetric;
+        bestSeedType = seedType;
+        if posErr > 0.06
+            bestFail = "posErr";
+        elseif limPenalty > 0.4
+            bestFail = "jointLimit";
+        else
+            bestFail = "ok";
+        end
     end
 end
 
 q = bestQ;
 ok = isfinite(bestErr) && bestErr < 0.06;
-info = struct('PosErr',bestErr,'Score',bestScore);
+info = struct('PosErr',bestErr,'Score',bestScore,'OutMetric',bestOut,'SeedType',char(bestSeedType),'FailReason',char(bestFail));
 end
 
-function [Q, stat] = solveTrajectorySequence(robot,ik,eeName,P,qHome,anchorQ,sideSign,shBody,elBody,elbowOutSoftW)
+function [Q, stat] = solveTrajectorySequence(robot,ik,eeName,P,qHome,anchorQ,sideSign,shBody,elBody,ikScore)
 N = size(P,1);
 Q = zeros(N, numel(qHome));
 succ = false(N,1);
 res = nan(N,1);
+outMetric = nan(N,1);
+seedType = strings(N,1);
+failPos = 0; failIK = 0; failLim = 0;
 
 qPrev = qHome;
 for k = 1:N
     idx = 1 + mod(k-1, numel(anchorQ));
     qA = anchorQ{idx};
 
-    [q, ok, info] = solveIKPoint(robot,ik,eeName,P(k,:),qPrev,qA,sideSign,shBody,elBody,elbowOutSoftW);
+    [q, ok, info] = solveIKPoint(robot,ik,eeName,P(k,:),qPrev,qA,sideSign,shBody,elBody,ikScore);
 
     if ok
         Q(k,:) = q;
         qPrev = q;
         succ(k) = true;
         res(k) = info.PosErr;
+        outMetric(k) = info.OutMetric;
+        seedType(k) = string(info.SeedType);
     else
         if k == 1
             Q(k,:) = qHome;
@@ -445,6 +492,14 @@ for k = 1:N
             Q(k,:) = Q(k-1,:);
         end
         qPrev = Q(k,:);
+        switch string(info.FailReason)
+            case "posErr"
+                failPos = failPos + 1;
+            case "jointLimit"
+                failLim = failLim + 1;
+            otherwise
+                failIK = failIK + 1;
+        end
     end
 end
 
@@ -453,11 +508,13 @@ bad = find(~succ);
 for i = 1:numel(bad)
     k = bad(i);
     qN = neighborSeed(Q,k,qHome);
-    [q, ok, info] = solveIKPoint(robot,ik,eeName,P(k,:),qN,qHome,sideSign,shBody,elBody,elbowOutSoftW);
+    [q, ok, info] = solveIKPoint(robot,ik,eeName,P(k,:),qN,qHome,sideSign,shBody,elBody,ikScore);
     if ok
         Q(k,:) = q;
         succ(k) = true;
         res(k) = info.PosErr;
+        outMetric(k) = info.OutMetric;
+        seedType(k) = string(info.SeedType);
     end
 end
 
@@ -465,6 +522,17 @@ stat = struct();
 stat.SuccessRate = mean(succ);
 stat.SuccessMask = succ;
 stat.MeanResidual = mean(res(succ));
+if any(succ)
+    stat.MaxResidual = max(res(succ));
+    stat.OutwardMean = mean(outMetric(succ));
+    stat.OutwardKeepRatio = mean(outMetric(succ) > 0);
+else
+    stat.MaxResidual = inf;
+    stat.OutwardMean = -inf;
+    stat.OutwardKeepRatio = 0;
+end
+stat.SeedTypeCounts = countSeedTypes(seedType);
+stat.FailCounts = struct('PosErr',failPos,'IK',failIK,'JointLimit',failLim);
 if ~isfinite(stat.MeanResidual)
     stat.MeanResidual = inf;
 end
@@ -588,11 +656,16 @@ outCenter = sideSign*Tel(1,4);
 end
 
 function ev = batchEval(robotL,robotR,ikL,ikR,eeL,eeR,qHome,aL,aR,qAL,qAR,shL,elL,shR,elR,center,abc,mode,nEval,xKeep,minEEDist,armBodiesL,armBodiesR,radL,radR,margin,broadMargin,elbowOutSoftW,backMargin,zRangeHalf)
+if mode == "strict"
+    ikScore = struct('Wpos',18.0,'Wcont',0.03,'Welbow',0.80,'Wmid',0.05,'Wlim',0.20,'OutMargin',0.03,'MidMargin',0.02);
+else
+    ikScore = struct('Wpos',18.0,'Wcont',0.03,'Welbow',0.30,'Wmid',0.05,'Wlim',0.20,'OutMargin',0.02,'MidMargin',0.01);
+end
 ikLsum = 0; ikRsum = 0; elLsum = 0; elRsum = 0; passCol=0;
 for i = 1:nEval
     [P1,P2] = generateDualTrajectory(aL,aR,max(50,round(5*20)),center,abc,xKeep,minEEDist,mode,i,backMargin,zRangeHalf);
-    [Q1,stL] = solveTrajectorySequence(robotL,ikL,eeL,P1,qHome,qAL,-1,shL,elL,elbowOutSoftW);
-    [Q2,stR] = solveTrajectorySequence(robotR,ikR,eeR,P2,qHome,qAR,+1,shR,elR,elbowOutSoftW);
+    [Q1,stL] = solveTrajectorySequence(robotL,ikL,eeL,P1,qHome,qAL,-1,shL,elL,ikScore);
+    [Q2,stR] = solveTrajectorySequence(robotR,ikR,eeR,P2,qHome,qAR,+1,shR,elR,ikScore);
     mL = elbowMetrics(robotL,Q1,shL,elL,-1);
     mR = elbowMetrics(robotR,Q2,shR,elR,+1);
     [col,~] = trajectoryArmCollision(robotL,Q1,armBodiesL,radL,robotR,Q2,armBodiesR,radR,margin,broadMargin);
@@ -826,6 +899,79 @@ end
 
 function qn = perturbSeed(q,sigma)
 qn = q + sigma*(2*rand(size(q))-1);
+end
+
+function qOut = makeOutwardSeed(qBase, sideSign)
+qOut = qBase;
+if isempty(qOut)
+    return;
+end
+if numel(qOut) >= 1
+    qOut(1) = qOut(1) + sideSign*deg2rad(14);
+end
+if numel(qOut) >= 2
+    qOut(2) = qOut(2) - sideSign*deg2rad(8);
+end
+if numel(qOut) >= 3
+    qOut(3) = qOut(3) + sideSign*deg2rad(6);
+end
+end
+
+function penalty = jointLimitPenalty(robot, q)
+[qMin, qMax] = jointLimitsCached(robot, numel(q));
+span = max(qMax-qMin, 1e-6);
+u = (q-qMin)./span;
+v = (qMax-q)./span;
+margin = 0.07;
+penalty = mean(softplus(margin-u, 25) + softplus(margin-v, 25));
+end
+
+function [qMin, qMax] = jointLimitsCached(robot, nQ)
+persistent cache
+if isempty(cache)
+    cache = containers.Map('KeyType','char','ValueType','any');
+end
+key = sprintf('b%d_n%d', numel(robot.Bodies), nQ);
+if isKey(cache,key)
+    lim = cache(key);
+    qMin = lim{1};
+    qMax = lim{2};
+    return;
+end
+
+qMin = -pi*ones(1,nQ);
+qMax = +pi*ones(1,nQ);
+idx = 0;
+for i = 1:numel(robot.Bodies)
+    j = robot.Bodies{i}.Joint;
+    if strcmpi(j.Type,'fixed')
+        continue;
+    end
+    idx = idx + 1;
+    if idx > nQ
+        break;
+    end
+    pl = j.PositionLimits;
+    if numel(pl)==2 && all(isfinite(pl))
+        qMin(idx)=pl(1);
+        qMax(idx)=pl(2);
+    end
+end
+cache(key) = {qMin, qMax};
+end
+
+function c = countSeedTypes(seedType)
+c = struct('prev',0,'home',0,'perturbPrev',0,'perturbHome',0,'outward',0,'none',0);
+for i = 1:numel(seedType)
+    s = char(seedType(i));
+    if isempty(s)
+        c.none = c.none + 1;
+    elseif isfield(c,s)
+        c.(s) = c.(s) + 1;
+    else
+        c.none = c.none + 1;
+    end
+end
 end
 
 
