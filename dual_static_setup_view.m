@@ -53,6 +53,7 @@ eePitchDeg = getOpt(opts, 'EEPitchDeg', -10);
 eeRollDeg = getOpt(opts, 'EERollDeg', 0);
 ikRotWeight = getOpt(opts, 'IKRotWeight', 0.10);
 ikOriScoreWeight = getOpt(opts, 'IKOriScoreWeight', 0.30);
+branchYawMinDeg = getOpt(opts, 'BranchYawMinDeg', 12);
 
 %% Path setup
 baseDir = fileparts(mfilename('fullpath'));
@@ -111,8 +112,8 @@ roll = deg2rad(eeRollDeg);
 RgoalL = rotmZYX(yawL, pitch, roll);
 RgoalR = rotmZYX(yawR, pitch, roll);
 
-repL = solveStaticIKMultiSeed(robotL, eeName, goalL, RgoalL, qHome, qHome, qMinL, qMaxL, shoulderL, elbowL, -1, baseLeftXYZ, wPos, wElbow, wJDist, wLim, outMargin, ikRotWeight, ikOriScoreWeight);
-repR = solveStaticIKMultiSeed(robotR, eeName, goalR, RgoalR, qHome, qHome, qMinR, qMaxR, shoulderR, elbowR, +1, baseRightXYZ, wPos, wElbow, wJDist, wLim, outMargin, ikRotWeight, ikOriScoreWeight);
+repL = solveStaticIKMultiSeed(robotL, eeName, goalL, RgoalL, qHome, qHome, qMinL, qMaxL, shoulderL, elbowL, -1, baseLeftXYZ, wPos, wElbow, wJDist, wLim, outMargin, ikRotWeight, ikOriScoreWeight, branchYawMinDeg);
+repR = solveStaticIKMultiSeed(robotR, eeName, goalR, RgoalR, qHome, qHome, qMinR, qMaxR, shoulderR, elbowR, +1, baseRightXYZ, wPos, wElbow, wJDist, wLim, outMargin, ikRotWeight, ikOriScoreWeight, branchYawMinDeg);
 
 if repL.ok
     qWorkL = repL.q;
@@ -151,10 +152,10 @@ if verbose
     fprintf('[dual_static_setup_view] workspaceCenter=(%.3f %.3f %.3f), workspaceSize=[%.3f %.3f %.3f], forwardOk=%d\n', ...
         workspaceCenter, workspaceSize, forwardOk);
     fprintf('[dual_static_setup_view] EE name=%s\n', eeName);
-    fprintf('[dual_static_setup_view] IK L: ok=%d posErr=%.4f oriErr=%.4f outwardMetricWorld=%.4f elbowX=%.4f baseX=%.4f dX=%.4f chosenSeed=%s score=%.4f clampUsed=%d exitFlag=%d\n', ...
-        repL.ok, repL.posErr, repL.oriErr, repL.elbowOutMetric, repL.elbowWorldX, repL.baseWorldX, repL.elbowDeltaX, repL.seedType, repL.score, repL.clampUsed, repL.exitFlag);
-    fprintf('[dual_static_setup_view] IK R: ok=%d posErr=%.4f oriErr=%.4f outwardMetricWorld=%.4f elbowX=%.4f baseX=%.4f dX=%.4f chosenSeed=%s score=%.4f clampUsed=%d exitFlag=%d\n', ...
-        repR.ok, repR.posErr, repR.oriErr, repR.elbowOutMetric, repR.elbowWorldX, repR.baseWorldX, repR.elbowDeltaX, repR.seedType, repR.score, repR.clampUsed, repR.exitFlag);
+    fprintf('[dual_static_setup_view] IK L: ok=%d posErr=%.4f oriErr=%.4f outwardMetricWorld=%.4f elbowX=%.4f baseX=%.4f dX=%.4f q1=%.4f branchOk=%d chosenSeed=%s score=%.4f clampUsed=%d exitFlag=%d\n', ...
+        repL.ok, repL.posErr, repL.oriErr, repL.elbowOutMetric, repL.elbowWorldX, repL.baseWorldX, repL.elbowDeltaX, repL.q1, repL.branchOk, repL.seedType, repL.score, repL.clampUsed, repL.exitFlag);
+    fprintf('[dual_static_setup_view] IK R: ok=%d posErr=%.4f oriErr=%.4f outwardMetricWorld=%.4f elbowX=%.4f baseX=%.4f dX=%.4f q1=%.4f branchOk=%d chosenSeed=%s score=%.4f clampUsed=%d exitFlag=%d\n', ...
+        repR.ok, repR.posErr, repR.oriErr, repR.elbowOutMetric, repR.elbowWorldX, repR.baseWorldX, repR.elbowDeltaX, repR.q1, repR.branchOk, repR.seedType, repR.score, repR.clampUsed, repR.exitFlag);
     fprintf('[dual_static_setup_view] margin notes: narrow threshold = rL + rR + collisionMargin, broad skip uses + broadMargin\n');
 end
 
@@ -247,20 +248,33 @@ end
 
 %% --------------------------- local helpers ---------------------------
 
-function report = solveStaticIKMultiSeed(robot, eeName, pGoal, Rgoal, qSeed, qRef, qMin, qMax, shoulderBody, elbowBody, sideSign, baseWorldXYZ, wPos, wElbow, wJDist, wLim, outMargin, ikRotWeight, ikOriScoreWeight)
+function report = solveStaticIKMultiSeed(robot, eeName, pGoal, Rgoal, qSeed, qRef, qMin, qMax, shoulderBody, elbowBody, sideSign, baseWorldXYZ, wPos, wElbow, wJDist, wLim, outMargin, ikRotWeight, ikOriScoreWeight, branchYawMinDeg)
 ik = inverseKinematics('RigidBodyTree', robot);
 Tgoal = [Rgoal, pGoal(:); 0 0 0 1];
 weights = [1 1 1 ikRotWeight ikRotWeight ikRotWeight];
+
+yawStrong = qRef;
+yawMedium = qRef;
+if numel(qRef) >= 1
+    yawStrong(1) = qRef(1) + sideSign*deg2rad(35);
+    yawMedium(1) = qRef(1) + sideSign*deg2rad(22);
+end
 
 seedList = { ...
     struct('q',qSeed,'type','qRef'), ...
     struct('q',qRef,'type','qHome'), ...
     struct('q',clampToLimits(applyFixedPerturbation(qSeed, 0.06), qMin, qMax),'type','perturb'), ...
-    struct('q',clampToLimits(makeOutwardSeed(qRef, sideSign), qMin, qMax),'type','outward')};
+    struct('q',clampToLimits(makeOutwardSeed(qRef, sideSign), qMin, qMax),'type','outward'), ...
+    struct('q',clampToLimits(yawMedium, qMin, qMax),'type','yawOutMedium'), ...
+    struct('q',clampToLimits(yawStrong, qMin, qMax),'type','yawOutStrong')};
 
 bestScore = inf;
+bestScoreUnconstrained = inf;
+bestUnconstrained = [];
+branchMin = deg2rad(branchYawMinDeg);
 report = struct('ok',false,'posErr',inf,'elbowOutMetric',nan,'elbowWorldX',nan,'baseWorldX',baseWorldXYZ(1), ...
-    'elbowDeltaX',nan,'oriErr',inf,'clampUsed',false,'exitFlag',-999,'score',inf,'q',qRef,'seedType','none','seedTypesTried','','jointLimitPenalty',inf);
+    'elbowDeltaX',nan,'oriErr',inf,'clampUsed',false,'exitFlag',-999,'score',inf,'q',qRef,'seedType','none','seedTypesTried','','jointLimitPenalty',inf, ...
+    'q1',qRef(1),'branchYawMin',branchMin,'branchOk',false);
 tried = strings(1, numel(seedList));
 
 for i = 1:numel(seedList)
@@ -288,6 +302,27 @@ for i = 1:numel(seedList)
     inwardPenalty = max(0, outMargin - elbowOut)^2;
     score = wPos*posErr + (4.0*wElbow)*inwardPenalty + wJDist*norm(qCand2 - qRef)^2 + wLim*limPenalty + ikOriScoreWeight*oriErr;
 
+    branchOkCand = true;
+    if numel(qCand2) >= 1
+        if sideSign == -1
+            branchOkCand = qCand2(1) >= +branchMin;
+        else
+            branchOkCand = qCand2(1) <= -branchMin;
+        end
+    end
+
+    if score < bestScoreUnconstrained
+        bestScoreUnconstrained = score;
+        bestUnconstrained = struct('ok',isfinite(posErr) && posErr < 0.08,'posErr',posErr,'elbowOutMetric',elbowOut, ...
+            'elbowWorldX',elbowWorldX,'baseWorldX',baseWorldX,'elbowDeltaX',deltaX,'oriErr',oriErr,'clampUsed',wasClamped, ...
+            'exitFlag',exitFlag,'score',score,'q',qCand2,'seedType',seedList{i}.type,'jointLimitPenalty',limPenalty, ...
+            'q1',qCand2(1),'branchYawMin',branchMin,'branchOk',branchOkCand);
+    end
+
+    if ~branchOkCand
+        continue;
+    end
+
     if score < bestScore
         bestScore = score;
         report.ok = isfinite(posErr) && posErr < 0.08;
@@ -303,7 +338,15 @@ for i = 1:numel(seedList)
         report.baseWorldX = baseWorldX;
         report.elbowDeltaX = deltaX;
         report.oriErr = oriErr;
+        report.q1 = qCand2(1);
+        report.branchYawMin = branchMin;
+        report.branchOk = branchOkCand;
     end
+end
+
+if ~isfinite(bestScore) && ~isempty(bestUnconstrained)
+    warning('[dual_static_setup_view] branch yaw constraint impossible; falling back to unconstrained best.');
+    report = bestUnconstrained;
 end
 report.seedTypesTried = char(strjoin(tried, ','));
 end
