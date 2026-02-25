@@ -34,6 +34,12 @@ useScenarioSearch = getOpt(opts, "UseScenarioSearch", false);
 % Base defaults: wide to reduce inter-arm conflict and improve right-arm reach.
 baseLeftXYZ  = getOpt(opts, "BaseLeftXYZ",  [-0.34 -0.12 0.00]);
 baseRightXYZ = getOpt(opts, "BaseRightXYZ", [+0.34 +0.12 0.00]);
+baseYawDegL  = getOpt(opts, "BaseYawDegL", 0);
+baseYawDegR  = getOpt(opts, "BaseYawDegR", 0);
+
+forwardOffset = getOpt(opts, "ForwardOffset", 0.50);
+backMargin    = getOpt(opts, "BackMargin", 0.05);
+zRangeHalf    = getOpt(opts, "ZRangeHalf", 0.12);
 
 % If user provides center, we use it. otherwise auto-estimate from neutral FK.
 userCenter = getOpt(opts, "WorkspaceCenter", []);
@@ -70,7 +76,7 @@ addpath(genpath(baseDir));
 
 [robotRaw, eeRaw, qHome] = loadRobotAutoEE(baseDir);
 
-[robotL, robotR] = placeDualRobots(robotRaw, baseLeftXYZ, baseRightXYZ);
+[robotL, robotR] = placeDualRobots(robotRaw, baseLeftXYZ, baseRightXYZ, baseYawDegL, baseYawDegR);
 eeL = resolveEEName(robotL, eeRaw);
 eeR = resolveEEName(robotR, eeRaw);
 
@@ -89,6 +95,7 @@ if verbose
     fprintf("\n[dual_target_workspace] Seed=%d mode=%s N=%d\n", seed, mode, N);
     fprintf("  IK backend L=%s R=%s\n", ikL.Mode, ikR.Mode);
     fprintf("  Base L=(%.3f %.3f %.3f) R=(%.3f %.3f %.3f)\n", baseLeftXYZ, baseRightXYZ);
+    fprintf("  Base yaw deg L/R=(%.1f, %.1f) | forwardOffset=%.3f\n", baseYawDegL, baseYawDegR, forwardOffset);
 end
 
 %% -------------------- EE frame quick diagnostics --------------------
@@ -100,21 +107,35 @@ if verbose
 end
 
 %% -------------------- center selection (bootstrap) --------------------
+minCenterY = max(baseLeftXYZ(2), baseRightXYZ(2)) + forwardOffset;
 if isempty(userCenter)
     centerAuto = 0.5*(TL0(1:3,4).' + TR0(1:3,4).') + [0.00, 0.05, 0.00];
 else
     centerAuto = userCenter;
 end
+centerAuto(1) = 0.0; % keep workspace centered in x
+if centerAuto(2) < minCenterY
+    if verbose && ~isempty(userCenter)
+        fprintf("  userCenter adjusted to satisfy forward constraint: y %.3f -> %.3f\n", centerAuto(2), minCenterY);
+    end
+    centerAuto(2) = minCenterY;
+end
 
 % Optional old-style scenario search can be enabled, but default is OFF.
 if useScenarioSearch
-    [centerSel, scenarioLog] = optionalScenarioCenterSearch(robotL,robotR,ikL,ikR,eeL,eeR,qHome,centerAuto,ellABC,xKeep,coarseSamplesPerArm,coarseScanCenters,verbose);
+    [centerSel, scenarioLog] = optionalScenarioCenterSearch(robotL,robotR,ikL,ikR,eeL,eeR,qHome,centerAuto,ellABC,xKeep,coarseSamplesPerArm,coarseScanCenters,verbose,minCenterY,backMargin,zRangeHalf);
 else
-    [centerSel, scenarioLog] = fallbackCenterScan(robotL,robotR,ikL,ikR,eeL,eeR,qHome,centerAuto,ellABC,xKeep,coarseSamplesPerArm,coarseScanCenters,verbose);
+    [centerSel, scenarioLog] = fallbackCenterScan(robotL,robotR,ikL,ikR,eeL,eeR,qHome,centerAuto,ellABC,xKeep,coarseSamplesPerArm,coarseScanCenters,verbose,minCenterY,backMargin,zRangeHalf);
+end
+centerSel(1) = 0.0;
+if centerSel(2) < minCenterY
+    centerSel(2) = minCenterY;
 end
 
+frontOK = (centerSel(2) >= minCenterY);
 if verbose
-    fprintf("  Selected workspace center=(%.3f %.3f %.3f), score=%.3f\n", centerSel, scenarioLog.BestScore);
+    fprintf("  Workspace center=(%.3f %.3f %.3f), score=%.3f\n", centerSel, scenarioLog.BestScore);
+    fprintf("  workspace is in front of both bases: %d (minY=%.3f)\n", frontOK, minCenterY);
 end
 
 %% -------------------- quick IK residual probe --------------------
@@ -128,8 +149,8 @@ end
 
 %% -------------------- reachable anchors --------------------
 reachOpt = struct("Samples", 60, "Needed", anchorNeeded, "XKeep", xKeep, "ElbowOutSoftW", elbowOutSoftW);
-[aL, qAL, rStatL] = collectReachableAnchors(robotL, ikL, eeL, qHome, centerSel, ellABC, -1, shL, elL, reachOpt);
-[aR, qAR, rStatR] = collectReachableAnchors(robotR, ikR, eeR, qHome, centerSel, ellABC, +1, shR, elR, reachOpt);
+[aL, qAL, rStatL] = collectReachableAnchors(robotL, ikL, eeL, qHome, centerSel, ellABC, -1, shL, elL, reachOpt, backMargin, zRangeHalf);
+[aR, qAR, rStatR] = collectReachableAnchors(robotR, ikR, eeR, qHome, centerSel, ellABC, +1, shR, elR, reachOpt, backMargin, zRangeHalf);
 
 if verbose
     fprintf("  Reachability: L %d/%d (mean residual=%.4f), R %d/%d (mean residual=%.4f)\n", ...
@@ -145,7 +166,7 @@ Q1 = []; Q2 = []; P1 = []; P2 = []; meta = struct();
 finalDiag = struct();
 
 for attempt = 1:maxTrajAttempts
-    [P1c, P2c, metaC] = generateDualTrajectory(aL, aR, N, centerSel, ellABC, xKeep, minEEDist, mode, attempt);
+    [P1c, P2c, metaC] = generateDualTrajectory(aL, aR, N, centerSel, ellABC, xKeep, minEEDist, mode, attempt, backMargin, zRangeHalf);
 
     if any(vecnorm(P1c-P2c,2,2) < minEEDist)
         continue;
@@ -196,7 +217,7 @@ if verbose
 end
 
 if numEvalTraj > 0
-    ev = batchEval(robotL,robotR,ikL,ikR,eeL,eeR,qHome,aL,aR,qAL,qAR,shL,elL,shR,elR,centerSel,ellABC,mode,numEvalTraj,xKeep,minEEDist,armBodiesL,armBodiesR,radMapL,radMapR,collisionMargin,broadMargin,elbowOutSoftW);
+    ev = batchEval(robotL,robotR,ikL,ikR,eeL,eeR,qHome,aL,aR,qAL,qAR,shL,elL,shR,elR,centerSel,ellABC,mode,numEvalTraj,xKeep,minEEDist,armBodiesL,armBodiesR,radMapL,radMapR,collisionMargin,broadMargin,elbowOutSoftW,backMargin,zRangeHalf);
     fprintf("[batch] IK mean L/R=%.1f%% / %.1f%% | elbow keep L/R=%.1f%% / %.1f%% | arm-arm pass=%.1f%%\n", ...
         100*ev.IKRateL,100*ev.IKRateR,100*ev.ElbowKeepL,100*ev.ElbowKeepR,100*ev.CollisionPass);
 end
@@ -209,25 +230,29 @@ end
 %%                               HELPERS
 %% =====================================================================
 
-function [centerSel, logOut] = optionalScenarioCenterSearch(robotL,robotR,ikL,ikR,eeL,eeR,qHome,center0,ellABC,xKeep,coarseSamples,scanN,verbose)
+function [centerSel, logOut] = optionalScenarioCenterSearch(robotL,robotR,ikL,ikR,eeL,eeR,qHome,center0,ellABC,xKeep,coarseSamples,scanN,verbose,minCenterY,backMargin,zRangeHalf)
 % Kept for compatibility. Now delegates to lightweight fallback scan.
-[centerSel, logOut] = fallbackCenterScan(robotL,robotR,ikL,ikR,eeL,eeR,qHome,center0,ellABC,xKeep,coarseSamples,scanN,verbose);
+[centerSel, logOut] = fallbackCenterScan(robotL,robotR,ikL,ikR,eeL,eeR,qHome,center0,ellABC,xKeep,coarseSamples,scanN,verbose,minCenterY,backMargin,zRangeHalf);
 end
 
-function [centerBest, logOut] = fallbackCenterScan(robotL,robotR,ikL,ikR,eeL,eeR,qHome,center0,ellABC,xKeep,coarseSamples,scanN,verbose)
+function [centerBest, logOut] = fallbackCenterScan(robotL,robotR,ikL,ikR,eeL,eeR,qHome,center0,ellABC,xKeep,coarseSamples,scanN,verbose,minCenterY,backMargin,zRangeHalf)
 % Data-driven center scan:
 % 1) Build candidate centers around neutral-FK-based center.
 % 2) Coarse IK success test (10-ish samples per arm) for each center.
 % 3) Choose best center with highest bilateral reach score.
 
-cand = generateCenterCandidates(center0, scanN);
+center0(1) = 0.0;
+if center0(2) < minCenterY
+    center0(2) = minCenterY;
+end
+cand = generateCenterCandidates(center0, scanN, minCenterY);
 score = -inf(size(cand,1),1);
 
 bestMeanResidual = inf;
 for i = 1:size(cand,1)
     c = cand(i,:);
-    [sL, rL] = coarseReachScore(robotL,ikL,eeL,qHome,c,ellABC,-1,xKeep,coarseSamples);
-    [sR, rR] = coarseReachScore(robotR,ikR,eeR,qHome,c,ellABC,+1,xKeep,coarseSamples);
+    [sL, rL] = coarseReachScore(robotL,ikL,eeL,qHome,c,ellABC,-1,xKeep,coarseSamples,backMargin,zRangeHalf);
+    [sR, rR] = coarseReachScore(robotR,ikR,eeR,qHome,c,ellABC,+1,xKeep,coarseSamples,backMargin,zRangeHalf);
 
     % bilateral score: both arms must be good.
     score(i) = min(sL,sR) + 0.25*(sL+sR);
@@ -244,20 +269,22 @@ end
 
 [~, idx] = max(score);
 centerBest = cand(idx,:);
+centerBest(1)=0.0;
+if centerBest(2)<minCenterY, centerBest(2)=minCenterY; end
 
 logOut = struct();
 logOut.BestScore = score(idx);
 logOut.BestMeanResidual = bestMeanResidual;
 end
 
-function cand = generateCenterCandidates(c0, n)
+function cand = generateCenterCandidates(c0, n, minCenterY)
 % lightweight y/z sweep around c0
 if n < 4
     n = 4;
 end
 
 cand = zeros(n,3);
-cand(1,:) = c0;
+cand(1,:) = [0.0, max(c0(2),minCenterY), c0(3)];
 
 k = 2;
 for dy = [-0.10 -0.06 -0.03 0 0.03 0.06 0.10]
@@ -265,24 +292,28 @@ for dy = [-0.10 -0.06 -0.03 0 0.03 0.06 0.10]
         if k > n
             return;
         end
-        cand(k,:) = c0 + [0, dy, dz];
+        yc = max(c0(2)+dy, minCenterY);
+        cand(k,:) = [0.0, yc, c0(3)+dz];
         k = k + 1;
     end
 end
 
 while k <= n
-    cand(k,:) = c0 + [0, 0.02*randn(), 0.02*randn()];
+    yc = max(c0(2)+0.02*randn(), minCenterY);
+    cand(k,:) = [0.0, yc, c0(3)+0.02*randn()];
     k = k + 1;
 end
 end
 
-function [ratio, meanResidual] = coarseReachScore(robot,ik,eeName,qHome,center,abc,sideSign,xKeep,samples)
+function [ratio, meanResidual] = coarseReachScore(robot,ik,eeName,qHome,center,abc,sideSign,xKeep,samples,backMargin,zRangeHalf)
 okN = 0;
 res = nan(samples,1);
 qPrev = qHome;
 for i = 1:samples
     p = samplePointInEllipsoid(center, abc, 0.65);
     p(1) = sideSign*max(abs(p(1)), xKeep);
+    p(2) = max(p(2), center(2)-backMargin);
+    p(3) = min(max(p(3), center(3)-zRangeHalf), center(3)+zRangeHalf);
     [q, ok, info] = solveIKPoint(robot,ik,eeName,p,qPrev,qHome,sideSign,'','',0.0);
     if ok
         okN = okN + 1;
@@ -297,7 +328,7 @@ if ~isfinite(meanResidual)
 end
 end
 
-function [anchors, anchorQ, stat] = collectReachableAnchors(robot,ik,eeName,qHome,center,abc,sideSign,shBody,elBody,opt)
+function [anchors, anchorQ, stat] = collectReachableAnchors(robot,ik,eeName,qHome,center,abc,sideSign,shBody,elBody,opt,backMargin,zRangeHalf)
 samples = getOpt(opt,"Samples",60);
 needed = getOpt(opt,"Needed",3);
 xKeep = getOpt(opt,"XKeep",0.09);
@@ -311,6 +342,8 @@ residuals = [];
 for i = 1:samples
     p = samplePointInEllipsoid(center, abc, 0.80);
     p(1) = sideSign*max(abs(p(1)), xKeep);
+    p(2) = max(p(2), center(2)-backMargin);
+    p(3) = min(max(p(3), center(3)-zRangeHalf), center(3)+zRangeHalf);
 
     seedAlt = perturbSeed(qPrev, 0.16);
     [q1, ok1, info1] = solveIKPoint(robot,ik,eeName,p,qPrev,qHome,sideSign,shBody,elBody,elbowW);
@@ -437,7 +470,7 @@ if ~isfinite(stat.MeanResidual)
 end
 end
 
-function [P1,P2,meta] = generateDualTrajectory(anchorL,anchorR,N,center,abc,xKeep,minEEDist,mode,attempt)
+function [P1,P2,meta] = generateDualTrajectory(anchorL,anchorR,N,center,abc,xKeep,minEEDist,mode,attempt,backMargin,zRangeHalf)
 A1 = cell2mat(anchorL(:));
 A2 = cell2mat(anchorR(:));
 A1 = [A1; A1(1,:)];
@@ -476,6 +509,10 @@ P2 = [interp1(t2,A2(:,1),tauR,'pchip'), interp1(t2,A2(:,2),tauR,'pchip'), interp
 [P1,P2] = clampInsideEllipsoid(P1,P2,center,abc,0.95);
 P1(:,1) = min(P1(:,1), -xKeep);
 P2(:,1) = max(P2(:,1), +xKeep);
+P1(:,2) = max(P1(:,2), center(2)-backMargin);
+P2(:,2) = max(P2(:,2), center(2)-backMargin);
+P1(:,3) = min(max(P1(:,3), center(3)-zRangeHalf), center(3)+zRangeHalf);
+P2(:,3) = min(max(P2(:,3), center(3)-zRangeHalf), center(3)+zRangeHalf);
 
 % If still too close, shift y slightly apart
 closeIdx = vecnorm(P1-P2,2,2) < minEEDist;
@@ -550,10 +587,10 @@ outLocal = sideSign*d(1);
 outCenter = sideSign*Tel(1,4);
 end
 
-function ev = batchEval(robotL,robotR,ikL,ikR,eeL,eeR,qHome,aL,aR,qAL,qAR,shL,elL,shR,elR,center,abc,mode,nEval,xKeep,minEEDist,armBodiesL,armBodiesR,radL,radR,margin,broadMargin,elbowOutSoftW)
+function ev = batchEval(robotL,robotR,ikL,ikR,eeL,eeR,qHome,aL,aR,qAL,qAR,shL,elL,shR,elR,center,abc,mode,nEval,xKeep,minEEDist,armBodiesL,armBodiesR,radL,radR,margin,broadMargin,elbowOutSoftW,backMargin,zRangeHalf)
 ikLsum = 0; ikRsum = 0; elLsum = 0; elRsum = 0; passCol=0;
 for i = 1:nEval
-    [P1,P2] = generateDualTrajectory(aL,aR,max(50,round(5*20)),center,abc,xKeep,minEEDist,mode,i);
+    [P1,P2] = generateDualTrajectory(aL,aR,max(50,round(5*20)),center,abc,xKeep,minEEDist,mode,i,backMargin,zRangeHalf);
     [Q1,stL] = solveTrajectorySequence(robotL,ikL,eeL,P1,qHome,qAL,-1,shL,elL,elbowOutSoftW);
     [Q2,stR] = solveTrajectorySequence(robotR,ikR,eeR,P2,qHome,qAR,+1,shR,elR,elbowOutSoftW);
     mL = elbowMetrics(robotL,Q1,shL,elL,-1);
@@ -584,7 +621,11 @@ show(robotR,Q2(1,:),"Parent",ax,"PreservePlot",true,"Visuals","on","Frames","off
 
 title(ax, sprintf("dual_target_workspace | mode=%s | vL=%.2f vR=%.2f phase=%.2f", meta.Mode, meta.LeftSpeed, meta.RightSpeed, meta.Phase));
 
-x0 = xlim(ax); y0 = ylim(ax); z0 = zlim(ax);
+TbL = getTransform(robotL,Q1(1,:),"world_base");
+TbR = getTransform(robotR,Q2(1,:),"world_base");
+basePts = [TbL(1:3,4).'; TbR(1:3,4).'];
+lims = computeSceneLimits(P1,P2,center,ellABC,basePts);
+setAxesLimits(ax,lims);
 rc = rateControl(fps);
 k=1; N = size(Q1,1);
 while ishandle(fig)
@@ -594,7 +635,7 @@ while ishandle(fig)
     plot3(ax,P2(:,1),P2(:,2),P2(:,3),"-","Color",[0.9 0.2 0.2],"LineWidth",1.2);
     show(robotL,Q1(k,:),"Parent",ax,"PreservePlot",true,"Visuals","on","Frames","off");
     show(robotR,Q2(k,:),"Parent",ax,"PreservePlot",true,"Visuals","on","Frames","off");
-    xlim(ax,x0); ylim(ax,y0); zlim(ax,z0);
+    setAxesLimits(ax,lims);
     drawnow;
     waitfor(rc);
     k = k + 1;
@@ -787,9 +828,26 @@ function qn = perturbSeed(q,sigma)
 qn = q + sigma*(2*rand(size(q))-1);
 end
 
-function [robotL,robotR] = placeDualRobots(robotRaw, baseL, baseR)
-TL = trvec2tform(baseL);
-TR = trvec2tform(baseR);
+
+function lims = computeSceneLimits(P1,P2,center,ellABC,basePts)
+allP = [P1; P2; basePts; center + [ellABC(1) ellABC(2) ellABC(3)]; center - [ellABC(1) ellABC(2) ellABC(3)]];
+mn = min(allP,[],1);
+mx = max(allP,[],1);
+pad = [0.20 0.20 0.20];
+lims = [mn-pad; mx+pad];
+end
+
+function setAxesLimits(ax,lims)
+xlim(ax,[lims(1,1), lims(2,1)]);
+ylim(ax,[lims(1,2), lims(2,2)]);
+zlim(ax,[max(0,lims(1,3)), lims(2,3)]);
+end
+
+function [robotL,robotR] = placeDualRobots(robotRaw, baseL, baseR, yawDegL, yawDegR)
+yL = deg2rad(yawDegL);
+yR = deg2rad(yawDegR);
+TL = trvec2tform(baseL) * axang2tform([0 0 1 yL]);
+TR = trvec2tform(baseR) * axang2tform([0 0 1 yR]);
 robotL = makePlacedRobot(robotRaw, TL);
 robotR = makePlacedRobot(robotRaw, TR);
 end
