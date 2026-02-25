@@ -45,7 +45,7 @@ wPos    = getOpt(opts, 'IKPosWeight', 18.0);
 wElbow  = getOpt(opts, 'IKElbowWeight', 0.9);
 wJDist  = getOpt(opts, 'IKJointDistWeight', 0.02);
 wLim    = getOpt(opts, 'IKJointLimitWeight', 0.20);
-outMargin = getOpt(opts, 'OutwardMargin', 0.03);
+outMargin = getOpt(opts, 'OutwardMargin', 0.02);
 
 %% Path setup
 baseDir = fileparts(mfilename('fullpath'));
@@ -97,8 +97,8 @@ dx = min(0.15, max(0.06, xKeep));
 goalL = projectInsideEllipsoid(workspaceCenter + [-dx, 0.00, goalLiftZ], workspaceCenter, workspaceSize, 0.95);
 goalR = projectInsideEllipsoid(workspaceCenter + [+dx, 0.00, goalLiftZ], workspaceCenter, workspaceSize, 0.95);
 
-repL = solveStaticIKMultiSeed(robotL, eeName, goalL, qHome, qHome, qMinL, qMaxL, shoulderL, elbowL, -1, wPos, wElbow, wJDist, wLim, outMargin);
-repR = solveStaticIKMultiSeed(robotR, eeName, goalR, qHome, qHome, qMinR, qMaxR, shoulderR, elbowR, +1, wPos, wElbow, wJDist, wLim, outMargin);
+repL = solveStaticIKMultiSeed(robotL, eeName, goalL, qHome, qHome, qMinL, qMaxL, shoulderL, elbowL, -1, baseLeftXYZ, wPos, wElbow, wJDist, wLim, outMargin);
+repR = solveStaticIKMultiSeed(robotR, eeName, goalR, qHome, qHome, qMinR, qMaxR, shoulderR, elbowR, +1, baseRightXYZ, wPos, wElbow, wJDist, wLim, outMargin);
 
 if repL.ok
     qWorkL = repL.q;
@@ -136,10 +136,10 @@ if verbose
     fprintf('[dual_static_setup_view] workspaceCenter=(%.3f %.3f %.3f), workspaceSize=[%.3f %.3f %.3f], forwardOk=%d\n', ...
         workspaceCenter, workspaceSize, forwardOk);
     fprintf('[dual_static_setup_view] EE name=%s\n', eeName);
-    fprintf('[dual_static_setup_view] IK L: ok=%d posErr=%.4f outwardMetric=%.4f chosenSeed=%s clampUsed=%d exitFlag=%d\n', ...
-        repL.ok, repL.posErr, repL.elbowOutMetric, repL.seedType, repL.clampUsed, repL.exitFlag);
-    fprintf('[dual_static_setup_view] IK R: ok=%d posErr=%.4f outwardMetric=%.4f chosenSeed=%s clampUsed=%d exitFlag=%d\n', ...
-        repR.ok, repR.posErr, repR.elbowOutMetric, repR.seedType, repR.clampUsed, repR.exitFlag);
+    fprintf('[dual_static_setup_view] IK L: ok=%d posErr=%.4f outwardMetricWorld=%.4f elbowX=%.4f baseX=%.4f dX=%.4f chosenSeed=%s clampUsed=%d exitFlag=%d\n', ...
+        repL.ok, repL.posErr, repL.elbowOutMetric, repL.elbowWorldX, repL.baseWorldX, repL.elbowDeltaX, repL.seedType, repL.clampUsed, repL.exitFlag);
+    fprintf('[dual_static_setup_view] IK R: ok=%d posErr=%.4f outwardMetricWorld=%.4f elbowX=%.4f baseX=%.4f dX=%.4f chosenSeed=%s clampUsed=%d exitFlag=%d\n', ...
+        repR.ok, repR.posErr, repR.elbowOutMetric, repR.elbowWorldX, repR.baseWorldX, repR.elbowDeltaX, repR.seedType, repR.clampUsed, repR.exitFlag);
     fprintf('[dual_static_setup_view] margin notes: narrow threshold = rL + rR + collisionMargin, broad skip uses + broadMargin\n');
 end
 
@@ -232,7 +232,7 @@ end
 
 %% --------------------------- local helpers ---------------------------
 
-function report = solveStaticIKMultiSeed(robot, eeName, pGoal, qSeed, qRef, qMin, qMax, shoulderBody, elbowBody, sideSign, wPos, wElbow, wJDist, wLim, outMargin)
+function report = solveStaticIKMultiSeed(robot, eeName, pGoal, qSeed, qRef, qMin, qMax, shoulderBody, elbowBody, sideSign, baseWorldXYZ, wPos, wElbow, wJDist, wLim, outMargin)
 ik = inverseKinematics('RigidBodyTree', robot);
 Tgoal = [eye(3), pGoal(:); 0 0 0 1];
 weights = [1 1 1 0.001 0.001 0.001]; % position-dominant
@@ -244,7 +244,8 @@ seedList = { ...
     struct('q',clampToLimits(makeOutwardSeed(qRef, sideSign), qMin, qMax),'type','outward')};
 
 bestScore = inf;
-report = struct('ok',false,'posErr',inf,'elbowOutMetric',nan,'clampUsed',false,'exitFlag',-999,'score',inf,'q',qRef,'seedType','none','seedTypesTried','','jointLimitPenalty',inf);
+report = struct('ok',false,'posErr',inf,'elbowOutMetric',nan,'elbowWorldX',nan,'baseWorldX',baseWorldXYZ(1), ...
+    'elbowDeltaX',nan,'clampUsed',false,'exitFlag',-999,'score',inf,'q',qRef,'seedType','none','seedTypesTried','','jointLimitPenalty',inf);
 tried = strings(1, numel(seedList));
 
 for i = 1:numel(seedList)
@@ -261,11 +262,11 @@ for i = 1:numel(seedList)
 
     Tcur = getTransform(robot, qCand2, eeName);
     posErr = norm(Tcur(1:3,4).' - pGoal, 2);
-    elbowOut = elbowOutScalar(robot, qCand2, shoulderBody, elbowBody, sideSign);
+    [elbowOut, elbowWorldX, baseWorldX, deltaX] = elbowOutScalarWorld(robot, qCand2, shoulderBody, elbowBody, sideSign, baseWorldXYZ);
     limPenalty = jointLimitPenalty(qCand2, qMin, qMax);
 
     inwardPenalty = max(0, outMargin - elbowOut)^2;
-    score = wPos*posErr + wElbow*inwardPenalty + wJDist*norm(qCand2 - qRef)^2 + wLim*limPenalty;
+    score = wPos*posErr + (4.0*wElbow)*inwardPenalty + wJDist*norm(qCand2 - qRef)^2 + wLim*limPenalty;
 
     if score < bestScore
         bestScore = score;
@@ -278,6 +279,9 @@ for i = 1:numel(seedList)
         report.q = qCand2;
         report.seedType = seedList{i}.type;
         report.jointLimitPenalty = limPenalty;
+        report.elbowWorldX = elbowWorldX;
+        report.baseWorldX = baseWorldX;
+        report.elbowDeltaX = deltaX;
     end
 end
 report.seedTypesTried = char(strjoin(tried, ','));
@@ -303,15 +307,30 @@ end
 
 function qOut = makeOutwardSeed(qBase, sideSign)
 qOut = qBase;
-if numel(qOut) >= 1
-    qOut(1) = qOut(1) + sideSign*deg2rad(16);
-end
 if numel(qOut) >= 2
     qOut(2) = qOut(2) - sideSign*deg2rad(10);
 end
 if numel(qOut) >= 3
     qOut(3) = qOut(3) + sideSign*deg2rad(6);
 end
+if numel(qOut) >= 4
+    qOut(4) = qOut(4) + sideSign*deg2rad(6);
+end
+end
+
+function [eOut, elbowWorldX, baseWorldX, deltaX] = elbowOutScalarWorld(robot, q, shoulderBody, elbowBody, sideSign, baseWorldXYZ)
+if isempty(shoulderBody) || isempty(elbowBody)
+    eOut = 0;
+    elbowWorldX = NaN;
+    baseWorldX = baseWorldXYZ(1);
+    deltaX = NaN;
+    return;
+end
+TelW = getTransform(robot, q, elbowBody);
+elbowWorldX = TelW(1,4);
+baseWorldX = baseWorldXYZ(1);
+deltaX = elbowWorldX - baseWorldX;
+eOut = sideSign * deltaX;
 end
 
 function y = softplus(x, beta)
