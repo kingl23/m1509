@@ -20,8 +20,8 @@ end
 robot = importrobot(urdfPath);
 robot.DataFormat = 'row';
 robot.Gravity = [0 0 -9.81];
-qHome = homeConfiguration(robot);
-qHome = reshape([qHome.JointPosition],1,[]);
+qHomeRaw = homeConfiguration(robot);
+qHome = normalizeConfigRow(qHomeRaw);
 
 bodyNames = robot.BodyNames;
 eeName = bodyNames{end};
@@ -114,6 +114,20 @@ fprintf('[dual_arm_demo] Seed=%d ws=[%.3f %.3f %.3f] baseL=[%.2f %.2f %.2f] base
 
 if opts.Visualize
     visualizeDual(robot,best.qL,best.qR,best.eeL,best.eeR,TL,TR,wsCenter,opts.WorkspaceSize,eeName);
+end
+end
+
+
+function qRow = normalizeConfigRow(qIn)
+if isnumeric(qIn)
+    qRow = reshape(qIn,1,[]);
+elseif isstruct(qIn)
+    if ~isfield(qIn,'JointPosition')
+        error('dual_arm_workspace_demo:BadHomeConfig','homeConfiguration struct에 JointPosition 필드가 없습니다.');
+    end
+    qRow = reshape([qIn.JointPosition],1,[]);
+else
+    error('dual_arm_workspace_demo:BadHomeConfigType','지원하지 않는 homeConfiguration 반환 타입: %s', class(qIn));
 end
 end
 
