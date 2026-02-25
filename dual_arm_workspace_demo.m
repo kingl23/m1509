@@ -20,11 +20,29 @@ end
 robot = importrobot(urdfPath);
 robot.DataFormat = 'row';
 robot.Gravity = [0 0 -9.81];
-qHomeRaw = homeConfiguration(robot);
-qHome = normalizeConfigRow(qHomeRaw);
 
 bodyNames = robot.BodyNames;
 eeName = bodyNames{end};
+
+qHomeCfg = homeConfiguration(robot);
+if isnumeric(qHomeCfg)
+    qHome = reshape(qHomeCfg,1,[]);
+elseif isstruct(qHomeCfg)
+    qHome = reshape([qHomeCfg.JointPosition],1,[]);
+else
+    error('dual_arm_workspace_demo:UnsupportedHomeConfigType','Unsupported homeConfiguration return type: %s', class(qHomeCfg));
+end
+
+fprintf('[dual_arm_demo] homeConfiguration class=%s, qHome length=%d\n', class(qHomeCfg), length(qHome));
+
+try
+    getTransform(robot,qHome,eeName);
+catch ME
+    fprintf(2,'[dual_arm_demo] self-check failed: DataFormat=%s eeName=%s size(qHome)=[%d %d]\n', ...
+        string(robot.DataFormat), eeName, size(qHome,1), size(qHome,2));
+    rethrow(ME);
+end
+
 if opts.Verbose
     fprintf('[dual_arm_demo] EE frame: %s\n', eeName);
 end
@@ -117,19 +135,6 @@ if opts.Visualize
 end
 end
 
-
-function qRow = normalizeConfigRow(qIn)
-if isnumeric(qIn)
-    qRow = reshape(qIn,1,[]);
-elseif isstruct(qIn)
-    if ~isfield(qIn,'JointPosition')
-        error('dual_arm_workspace_demo:BadHomeConfig','homeConfiguration struct에 JointPosition 필드가 없습니다.');
-    end
-    qRow = reshape([qIn.JointPosition],1,[]);
-else
-    error('dual_arm_workspace_demo:BadHomeConfigType','지원하지 않는 homeConfiguration 반환 타입: %s', class(qIn));
-end
-end
 
 function opts = parseOptions(varargin)
 p = inputParser;
