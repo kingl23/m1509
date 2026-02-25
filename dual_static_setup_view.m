@@ -65,50 +65,34 @@ qMaxL = extractJointMaxs(robotL, qHome);
 qMinR = extractJointMins(robotR, qHome);
 qMaxR = extractJointMaxs(robotR, qHome);
 
-%% Workspace center selection (forward + below-shoulder constraints)
+%% Workspace center selection (shoulder-frame belly-front semantics)
 userCenter = getOpt(opts, 'WorkspaceCenter', []);
-baseZRef = 0.5*(baseLeftXYZ(3) + baseRightXYZ(3));
+workspaceX = mean([baseLeftXYZ(1), baseRightXYZ(1)]);
 if isempty(userCenter)
-    centerX = 0.0;
-    centerY = max(baseLeftXYZ(2), baseRightXYZ(2)) + forwardOffset;
-    centerZ = baseZRef + workspaceZRel;
-    center  = [centerX, centerY, centerZ];
+    workspaceCenter = [workspaceX, forwardOffset, workspaceZRel];
 else
-    center = userCenter;
+    workspaceCenter = userCenter;
+    workspaceCenter(1) = workspaceX;
+    workspaceCenter(2) = forwardOffset;
+    workspaceCenter(3) = workspaceZRel;
 end
 
-forwardMinY = max(baseLeftXYZ(2), baseRightXYZ(2)) + forwardOffset;
-if center(2) < forwardMinY
-    if verbose
-        fprintf('[dual_static_setup_view] user/proposed workspaceCenter adjusted for forward constraint: y %.3f -> %.3f\n', center(2), forwardMinY);
-    end
-    center(2) = forwardMinY;
-end
-
-% Shoulder-reference Z rule: workspace below shoulder (base) and below 0 by default semantics
-zMaxAllowed = min(baseZRef + workspaceZRel, -1e-3);
-if center(3) >= zMaxAllowed
-    if verbose
-        fprintf('[dual_static_setup_view] user/proposed workspaceCenter adjusted for below-shoulder constraint: z %.3f -> %.3f\n', center(3), zMaxAllowed);
-    end
-    center(3) = zMaxAllowed;
-end
-
-% Keep centered in x for symmetric "dual-arm" setup
-center(1) = 0.0;
-forwardOk = center(2) >= forwardMinY;
+assert(workspaceCenter(3) < 0, 'Workspace Z must be below shoulder (Z<0).');
+forwardOk = workspaceCenter(2) > max(baseLeftXYZ(2), baseRightXYZ(2));
 
 %% Work posture IK goals near center (slight left/right split)
-goalL = center + [-xKeep, 0, 0];
-goalR = center + [+xKeep, 0, 0];
+goalL = workspaceCenter + [-xKeep, 0, 0];
+goalR = workspaceCenter + [+xKeep, 0, 0];
 
 [qWorkL, repL] = solveWorkIK(robotL, eeName, qHome, goalL, shoulderL, elbowL, -1, qMinL, qMaxL, wPos, wElbow, wJDist);
 [qWorkR, repR] = solveWorkIK(robotR, eeName, qHome, goalR, shoulderR, elbowR, +1, qMinR, qMaxR, wPos, wElbow, wJDist);
 
 if ~repL.ok
+    warning('[dual_static_setup_view] Left IK failed at static setup (posErr=%.4f, exitFlag=%d). Using qHome.', repL.posErr, repL.exitFlag);
     qWorkL = qHome;
 end
 if ~repR.ok
+    warning('[dual_static_setup_view] Right IK failed at static setup (posErr=%.4f, exitFlag=%d). Using qHome.', repR.posErr, repR.exitFlag);
     qWorkR = qHome;
 end
 
@@ -126,7 +110,7 @@ if verbose
     fprintf('\n[dual_static_setup_view] baseL=(%.3f %.3f %.3f), baseR=(%.3f %.3f %.3f)\n', baseLeftXYZ, baseRightXYZ);
     fprintf('[dual_static_setup_view] baseYawDeg L/R=(%.1f, %.1f), forwardOffset=%.3f, WorkspaceZRel=%.3f\n', baseYawDegL, baseYawDegR, forwardOffset, workspaceZRel);
     fprintf('[dual_static_setup_view] workspaceCenter=(%.3f %.3f %.3f), workspaceSize=[%.3f %.3f %.3f], forwardOk=%d\n', ...
-        center, workspaceSize, forwardOk);
+        workspaceCenter, workspaceSize, forwardOk);
     fprintf('[dual_static_setup_view] EE name=%s\n', eeName);
     fprintf('[dual_static_setup_view] IK L: ok=%d posErr=%.4f elbowOut=%.4f clampUsed=%d exitFlag=%d\n', ...
         repL.ok, repL.posErr, repL.elbowOutMetric, repL.clampUsed, repL.exitFlag);
@@ -142,7 +126,9 @@ view(ax, 35, 18);
 xlabel(ax,'X [m]'); ylabel(ax,'Y [m]'); zlabel(ax,'Z [m]');
 title(ax,'Dual Static Setup: Work Posture + Forward Workspace + Capsule Ranges');
 
-plotEllipsoid(ax, center, workspaceSize(1), workspaceSize(2), workspaceSize(3));
+plotEllipsoid(ax, workspaceCenter, workspaceSize(1), workspaceSize(2), workspaceSize(3));
+plot3(ax, workspaceCenter(1), workspaceCenter(2), workspaceCenter(3), 'ko', 'MarkerSize', 8, 'LineWidth', 2);
+text(ax, workspaceCenter(1), workspaceCenter(2), workspaceCenter(3), '  Workspace (belly front)', 'FontSize', 10);
 plot3(ax, [-1 1], [0 0], [0 0], ':', 'Color', [0.25 0.25 0.25], 'LineWidth', 1.0);
 
 show(robotL, qWorkL, 'Parent', ax, 'PreservePlot', true, 'Visuals','on', 'Frames','off');
@@ -188,19 +174,19 @@ if ~isempty(capsulesL) && ~isempty(capsulesR)
     broadTh = narrowTh + broadMargin;
     thTxt = sprintf(['Example pair threshold:\n',' narrow: d < rL + rR + collisionMargin\n',' values: %.4f + %.4f + %.4f = %.4f\n',' broad skip: narrow + broadMargin = %.4f + %.4f = %.4f\n',' Base is shoulder reference (z=0), workspace is below shoulder.'], ...
         exL.r, exR.r, collisionMargin, narrowTh, narrowTh, broadMargin, broadTh);
-    text(ax, center(1), center(2)-workspaceSize(2)-0.22, center(3)+workspaceSize(3)+0.15, thTxt, 'BackgroundColor','w', 'FontSize',8);
+    text(ax, workspaceCenter(1), workspaceCenter(2)-workspaceSize(2)-0.22, workspaceCenter(3)+workspaceSize(3)+0.15, thTxt, 'BackgroundColor','w', 'FontSize',8);
 end
 
 legend(ax, {'Workspace ellipsoid (fixed size)','Goal L','Goal R','Base L (shoulder ref)','Base R (shoulder ref)','Left capsules (core+margin)','Right capsules (core+margin)'}, ...
     'Location','bestoutside');
 
 % Auto-limits include bases + workspace + goals + capsule endpoints
-lims = computeStaticLimits(baseLeftXYZ, baseRightXYZ, center, workspaceSize, goalL, goalR, capsulesL, capsulesR);
-xlim(ax, lims(1,:)); ylim(ax, lims(2,:)); zlim(ax, lims(3,:));
+lims = computeStaticLimits(baseLeftXYZ, baseRightXYZ, workspaceCenter, workspaceSize, goalL, goalR, capsulesL, capsulesR);
+xlim(ax, lims(1,:)); ylim(ax, lims(2,:)); zlim(ax, [workspaceZRel - 0.3, 1.2]);
 
 %% Output struct
 out = struct();
-out.workspaceCenter = center;
+out.workspaceCenter = workspaceCenter;
 out.workspaceSize = workspaceSize;
 out.baseLeftXYZ = baseLeftXYZ;
 out.baseRightXYZ = baseRightXYZ;
