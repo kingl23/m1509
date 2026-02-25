@@ -44,6 +44,8 @@ broadMargin     = getOpt(opts, 'BroadMargin', 0.10);
 wPos    = getOpt(opts, 'IKPosWeight', 18.0);
 wElbow  = getOpt(opts, 'IKElbowWeight', 0.9);
 wJDist  = getOpt(opts, 'IKJointDistWeight', 0.02);
+wLim    = getOpt(opts, 'IKJointLimitWeight', 0.20);
+outMargin = getOpt(opts, 'OutwardMargin', 0.03);
 
 %% Path setup
 baseDir = fileparts(mfilename('fullpath'));
@@ -78,6 +80,7 @@ if isempty(userCenter)
     workspaceCenter = [workspaceX, forwardOffset, baseZ + workspaceZRel];
 else
     workspaceCenter = userCenter;
+    workspaceCenter(1) = 0.0;
 end
 
 forwardOk = workspaceCenter(2) >= forwardMinY;
@@ -94,16 +97,27 @@ dx = min(0.15, max(0.06, xKeep));
 goalL = projectInsideEllipsoid(workspaceCenter + [-dx, 0.00, goalLiftZ], workspaceCenter, workspaceSize, 0.95);
 goalR = projectInsideEllipsoid(workspaceCenter + [+dx, 0.00, goalLiftZ], workspaceCenter, workspaceSize, 0.95);
 
-repL = solveStaticIKMultiSeed(robotL, eeName, goalL, qHome, qMinL, qMaxL, shoulderL, elbowL, -1, wPos, wElbow, wJDist);
-repR = solveStaticIKMultiSeed(robotR, eeName, goalR, qHome, qMinR, qMaxR, shoulderR, elbowR, +1, wPos, wElbow, wJDist);
-qWorkL = repL.q;
-qWorkR = repR.q;
+repL = solveStaticIKMultiSeed(robotL, eeName, goalL, qHome, qHome, qMinL, qMaxL, shoulderL, elbowL, -1, wPos, wElbow, wJDist, wLim, outMargin);
+repR = solveStaticIKMultiSeed(robotR, eeName, goalR, qHome, qHome, qMinR, qMaxR, shoulderR, elbowR, +1, wPos, wElbow, wJDist, wLim, outMargin);
+
+if repL.ok
+    qWorkL = repL.q;
+else
+    qWorkL = qHome;
+end
+if repR.ok
+    qWorkR = repR.q;
+else
+    qWorkR = qHome;
+end
 
 if ~repL.ok
-    warning('[dual_static_setup_view] Left IK failed at static setup (posErr=%.4f, exitFlag=%d). Using best candidate.', repL.posErr, repL.exitFlag);
+    warning('[dual_static_setup_view] Left IK failed: posErr=%.4f exitFlag=%d outward=%.4f bestScore=%.4f seedTypes=%s. Rendering qHome.', ...
+        repL.posErr, repL.exitFlag, repL.elbowOutMetric, repL.score, repL.seedTypesTried);
 end
 if ~repR.ok
-    warning('[dual_static_setup_view] Right IK failed at static setup (posErr=%.4f, exitFlag=%d). Using best candidate.', repR.posErr, repR.exitFlag);
+    warning('[dual_static_setup_view] Right IK failed: posErr=%.4f exitFlag=%d outward=%.4f bestScore=%.4f seedTypes=%s. Rendering qHome.', ...
+        repR.posErr, repR.exitFlag, repR.elbowOutMetric, repR.score, repR.seedTypesTried);
 end
 
 %% Capsule proxies at work posture
@@ -122,10 +136,10 @@ if verbose
     fprintf('[dual_static_setup_view] workspaceCenter=(%.3f %.3f %.3f), workspaceSize=[%.3f %.3f %.3f], forwardOk=%d\n', ...
         workspaceCenter, workspaceSize, forwardOk);
     fprintf('[dual_static_setup_view] EE name=%s\n', eeName);
-    fprintf('[dual_static_setup_view] IK L: ok=%d posErr=%.4f elbowOut=%.4f clampUsed=%d exitFlag=%d\n', ...
-        repL.ok, repL.posErr, repL.elbowOutMetric, repL.clampUsed, repL.exitFlag);
-    fprintf('[dual_static_setup_view] IK R: ok=%d posErr=%.4f elbowOut=%.4f clampUsed=%d exitFlag=%d\n', ...
-        repR.ok, repR.posErr, repR.elbowOutMetric, repR.clampUsed, repR.exitFlag);
+    fprintf('[dual_static_setup_view] IK L: ok=%d posErr=%.4f outwardMetric=%.4f chosenSeed=%s clampUsed=%d exitFlag=%d\n', ...
+        repL.ok, repL.posErr, repL.elbowOutMetric, repL.seedType, repL.clampUsed, repL.exitFlag);
+    fprintf('[dual_static_setup_view] IK R: ok=%d posErr=%.4f outwardMetric=%.4f chosenSeed=%s clampUsed=%d exitFlag=%d\n', ...
+        repR.ok, repR.posErr, repR.elbowOutMetric, repR.seedType, repR.clampUsed, repR.exitFlag);
     fprintf('[dual_static_setup_view] margin notes: narrow threshold = rL + rR + collisionMargin, broad skip uses + broadMargin\n');
 end
 
@@ -155,17 +169,13 @@ plot3(ax, baseRightXYZ(1),baseRightXYZ(2),baseRightXYZ(3),'s','Color',[0.7 0 0],
 % Capsules: per-link center lines + margin envelope lines
 for i = 1:numel(capsulesL)
     c = capsulesL(i);
-    lwCore = max(1.2, 65*c.r);
-    lwOut  = max(1.8, 65*(c.r + collisionMargin));
-    plot3(ax,[c.p0(1) c.p1(1)],[c.p0(2) c.p1(2)],[c.p0(3) c.p1(3)],'-','Color',[0.55 0.75 1.0],'LineWidth',lwOut);
-    plot3(ax,[c.p0(1) c.p1(1)],[c.p0(2) c.p1(2)],[c.p0(3) c.p1(3)],'-','Color',[0.1 0.35 0.95],'LineWidth',lwCore);
+    drawCapsuleSwept(ax, c.p0, c.p1, c.r, [0.1 0.35 0.95], 0.20);
+    drawCapsuleSwept(ax, c.p0, c.p1, c.r + collisionMargin, [0.55 0.75 1.0], 0.08);
 end
 for i = 1:numel(capsulesR)
     c = capsulesR(i);
-    lwCore = max(1.2, 65*c.r);
-    lwOut  = max(1.8, 65*(c.r + collisionMargin));
-    plot3(ax,[c.p0(1) c.p1(1)],[c.p0(2) c.p1(2)],[c.p0(3) c.p1(3)],'-','Color',[1.0 0.75 0.75],'LineWidth',lwOut);
-    plot3(ax,[c.p0(1) c.p1(1)],[c.p0(2) c.p1(2)],[c.p0(3) c.p1(3)],'-','Color',[0.95 0.2 0.2],'LineWidth',lwCore);
+    drawCapsuleSwept(ax, c.p0, c.p1, c.r, [0.95 0.2 0.2], 0.20);
+    drawCapsuleSwept(ax, c.p0, c.p1, c.r + collisionMargin, [1.0 0.75 0.75], 0.08);
 end
 
 for i = 1:min(3,numel(capsulesL))
@@ -214,27 +224,32 @@ out.forwardOk = forwardOk;
 out.forwardMinY = forwardMinY;
 out.ikReportL = repL;
 out.ikReportR = repR;
+out.outwardMetricL = repL.elbowOutMetric;
+out.outwardMetricR = repR.elbowOutMetric;
 out.figureHandle = fig;
 
 end
 
 %% --------------------------- local helpers ---------------------------
 
-function report = solveStaticIKMultiSeed(robot, eeName, pGoal, qHome, qMin, qMax, shoulderBody, elbowBody, sideSign, wPos, wElbow, wJDist)
+function report = solveStaticIKMultiSeed(robot, eeName, pGoal, qSeed, qRef, qMin, qMax, shoulderBody, elbowBody, sideSign, wPos, wElbow, wJDist, wLim, outMargin)
 ik = inverseKinematics('RigidBodyTree', robot);
 Tgoal = [eye(3), pGoal(:); 0 0 0 1];
 weights = [1 1 1 0.001 0.001 0.001]; % position-dominant
 
-seeds = {
-    qHome, ...
-    clampToLimits(applyFixedPerturbation(qHome, 0.06), qMin, qMax), ...
-    clampToLimits(applyAltBias(qHome), qMin, qMax)};
+seedList = { ...
+    struct('q',qSeed,'type','qRef'), ...
+    struct('q',qRef,'type','qHome'), ...
+    struct('q',clampToLimits(applyFixedPerturbation(qSeed, 0.06), qMin, qMax),'type','perturb'), ...
+    struct('q',clampToLimits(makeOutwardSeed(qRef, sideSign), qMin, qMax),'type','outward')};
 
 bestScore = inf;
-report = struct('ok',false,'posErr',inf,'elbowOutMetric',nan,'clampUsed',false,'exitFlag',-999,'score',inf,'q',qHome);
+report = struct('ok',false,'posErr',inf,'elbowOutMetric',nan,'clampUsed',false,'exitFlag',-999,'score',inf,'q',qRef,'seedType','none','seedTypesTried','','jointLimitPenalty',inf);
+tried = strings(1, numel(seedList));
 
-for i = 1:numel(seeds)
-    q0 = clampToLimits(seeds{i}, qMin, qMax);
+for i = 1:numel(seedList)
+    q0 = clampToLimits(seedList{i}.q, qMin, qMax);
+    tried(i) = string(seedList{i}.type);
     [qCand, info] = ik(eeName, Tgoal, weights, q0);
     exitFlag = parseExitFlag(info);
 
@@ -247,8 +262,10 @@ for i = 1:numel(seeds)
     Tcur = getTransform(robot, qCand2, eeName);
     posErr = norm(Tcur(1:3,4).' - pGoal, 2);
     elbowOut = elbowOutScalar(robot, qCand2, shoulderBody, elbowBody, sideSign);
+    limPenalty = jointLimitPenalty(qCand2, qMin, qMax);
 
-    score = wPos*posErr + wElbow*softplus(0.010 - elbowOut, 30) + wJDist*norm(qCand2 - qHome)^2;
+    inwardPenalty = max(0, outMargin - elbowOut)^2;
+    score = wPos*posErr + wElbow*inwardPenalty + wJDist*norm(qCand2 - qRef)^2 + wLim*limPenalty;
 
     if score < bestScore
         bestScore = score;
@@ -259,8 +276,11 @@ for i = 1:numel(seeds)
         report.exitFlag = exitFlag;
         report.score = score;
         report.q = qCand2;
+        report.seedType = seedList{i}.type;
+        report.jointLimitPenalty = limPenalty;
     end
 end
+report.seedTypesTried = char(strjoin(tried, ','));
 end
 
 function qBias = applyAltBias(q)
@@ -281,6 +301,19 @@ for k = 1:numel(qPert)
 end
 end
 
+function qOut = makeOutwardSeed(qBase, sideSign)
+qOut = qBase;
+if numel(qOut) >= 1
+    qOut(1) = qOut(1) + sideSign*deg2rad(16);
+end
+if numel(qOut) >= 2
+    qOut(2) = qOut(2) - sideSign*deg2rad(10);
+end
+if numel(qOut) >= 3
+    qOut(3) = qOut(3) + sideSign*deg2rad(6);
+end
+end
+
 function y = softplus(x, beta)
 y = (1/beta)*log(1 + exp(beta*x));
 end
@@ -297,12 +330,26 @@ if isempty(shoulderBody) || isempty(elbowBody)
     eOut = 0;
     return;
 end
-Tel = getTransform(robot, q, elbowBody);
-if sideSign < 0
-    eOut = -Tel(1,4);
-else
-    eOut = +Tel(1,4);
+TelW = getTransform(robot, q, elbowBody);
+Tbase = getBaseTransform(robot, q);
+pElB = Tbase \ [TelW(1:3,4); 1];
+elbowX = pElB(1);
+eOut = sideSign * elbowX;
 end
+
+function Tbase = getBaseTransform(robot, q)
+if any(strcmp(robot.BodyNames, 'world_base'))
+    Tbase = getTransform(robot, q, 'world_base');
+else
+    Tbase = eye(4);
+end
+end
+
+function penalty = jointLimitPenalty(q, qMin, qMax)
+span = max(qMax-qMin, 1e-6);
+u = (q-qMin)./span;
+v = (qMax-q)./span;
+penalty = mean(softplus(0.06-u,25) + softplus(0.06-v,25));
 end
 
 function q = clampToLimits(q, qMin, qMax)
@@ -498,6 +545,45 @@ if isKey(radMap, bodyName)
 else
     r = 0.045;
 end
+end
+
+function drawCapsuleSwept(ax, p0, p1, r, rgb, faceAlpha)
+v = p1 - p0;
+L = norm(v);
+if L < 1e-8
+    return;
+end
+
+[xc,yc,zc] = cylinder(r, 14);
+zc = zc * L;
+
+% Build orthonormal basis where ez aligns with segment direction
+ez = v / L;
+tmp = [0 0 1];
+if abs(dot(ez,tmp)) > 0.95
+    tmp = [0 1 0];
+end
+ex = cross(tmp, ez); ex = ex / norm(ex);
+ey = cross(ez, ex);
+R = [ex(:), ey(:), ez(:)];
+
+P = R * [xc(:)'; yc(:)'; zc(:)'];
+X = reshape(P(1,:), size(xc)) + p0(1);
+Y = reshape(P(2,:), size(yc)) + p0(2);
+Z = reshape(P(3,:), size(zc)) + p0(3);
+surf(ax, X, Y, Z, 'FaceColor', rgb, 'FaceAlpha', faceAlpha, 'EdgeAlpha', 0.06, 'EdgeColor', rgb);
+
+[xs,ys,zs] = sphere(10);
+P1 = R * [r*xs(:)'; r*ys(:)'; r*zs(:)'];
+X1 = reshape(P1(1,:), size(xs)) + p0(1);
+Y1 = reshape(P1(2,:), size(ys)) + p0(2);
+Z1 = reshape(P1(3,:), size(zs)) + p0(3);
+surf(ax, X1, Y1, Z1, 'FaceColor', rgb, 'FaceAlpha', faceAlpha, 'EdgeAlpha', 0.03, 'EdgeColor', rgb);
+
+X2 = reshape(P1(1,:), size(xs)) + p1(1);
+Y2 = reshape(P1(2,:), size(ys)) + p1(2);
+Z2 = reshape(P1(3,:), size(zs)) + p1(3);
+surf(ax, X2, Y2, Z2, 'FaceColor', rgb, 'FaceAlpha', faceAlpha, 'EdgeAlpha', 0.03, 'EdgeColor', rgb);
 end
 
 function plotEllipsoid(ax, c0, a, b, c)
