@@ -1,390 +1,498 @@
 function dual_target_workspace(opts)
 % DUAL_TARGET_WORKSPACE
-% Robust dual-arm trajectory synthesis with:
-%   1) high-probability IK convergence (multi-start + continuity seeds)
-%   2) distinct left/right trajectories (speed/profile/phase/anchor set)
-%   3) elbow-out posture regularization
-%   4) arm-arm capsule collision rejection as final strong gate
+% Bootstrap-first dual-arm demo:
+%   - default mode='bootstrap' : prioritize finding at least 1 valid trajectory fast
+%   - optional mode='strict'   : stronger elbow-out/collision constraints
 %
-% Dependency notes:
-%   - Requires Robotics System Toolbox for importrobot/getTransform/rigidBodyTree.
-%   - If inverseKinematics object is unavailable, a numeric fallback solver is used.
-%
-% Example:
-%   dual_target_workspace();
-%   dual_target_workspace(struct("Seed",1,"NumEvalTraj",20,"Verbose",true));
+% Core goals:
+%   1) Seed=1 default run should find at least one trajectory and visualize.
+%   2) Avoid early death from heavy scenario filtering.
+%   3) Print immediate diagnostics for EE frame / IK residual / reachability causes.
 
 if nargin < 1
     opts = struct();
 end
 
-%% ------------------------- GLOBAL OPTIONS --------------------------
+%% ------------------------- user options -------------------------
 seed = getOpt(opts, "Seed", 1);
 rng(seed);
 
-% Workspace size must stay fixed by requirement.
-ellABC = [0.450, 0.300, 0.300];
-
-% Timing / samples
-Ttotal = getOpt(opts, "Ttotal", 7.0);
-fps    = getOpt(opts, "Fps", 20);
-N      = max(40, round(Ttotal*fps));
-
-% Attempts
-maxScenarioSelectTries = getOpt(opts, "MaxScenarioSelectTries", 3);
-maxTrajTriesPerScenario = getOpt(opts, "MaxTrajTriesPerScenario", 70);
-
-% Geometric guards
-xKeep       = getOpt(opts, "XKeep", 0.10);
-minEEDist   = getOpt(opts, "MinEEDist", 0.22);
-
-% Posture margins (soft in IK objective, hard in final validation)
-elbowOutMarginLocal  = getOpt(opts, "ElbowOutMarginLocal", 0.010);
-elbowOutMarginCenter = getOpt(opts, "ElbowOutMarginCenter", 0.015);
-elbowUpMargin        = getOpt(opts, "ElbowUpMargin", -0.005); % soft-upward naturalness; relaxed hard gate
-
-% Collision thresholds
-capsuleMargin = getOpt(opts, "CapsuleMargin", 0.018);
-broadMargin   = getOpt(opts, "BroadMargin", 0.10);
-
-% Logging
+mode = string(getOpt(opts, "Mode", "bootstrap")); % 'bootstrap' | 'strict'
 verbose = getOpt(opts, "Verbose", true);
 verboseCollision = getOpt(opts, "VerboseCollision", true);
+
+Ttotal = getOpt(opts, "Ttotal", 6.0);
+fps = getOpt(opts, "Fps", 20);
+N = max(50, round(Ttotal*fps));
+
+% Workspace size MUST stay fixed by requirement.
+ellABC = [0.450, 0.300, 0.300];
+
+% Scenario search now optional (default OFF as requested)
+useScenarioSearch = getOpt(opts, "UseScenarioSearch", false);
+
+% Base defaults: wide to reduce inter-arm conflict and improve right-arm reach.
+baseLeftXYZ  = getOpt(opts, "BaseLeftXYZ",  [-0.34 -0.12 0.00]);
+baseRightXYZ = getOpt(opts, "BaseRightXYZ", [+0.34 +0.12 0.00]);
+
+% If user provides center, we use it. otherwise auto-estimate from neutral FK.
+userCenter = getOpt(opts, "WorkspaceCenter", []);
+
+% IK / attempt budgets (light)
+maxTrajAttempts = getOpt(opts, "MaxTrajAttempts", 35);
+coarseScanCenters = getOpt(opts, "CoarseScanCenters", 15); % fallback center scan count
+coarseSamplesPerArm = getOpt(opts, "CoarseSamplesPerArm", 10);
+anchorNeeded = getOpt(opts, "AnchorNeeded", 3);
+
+xKeep = getOpt(opts, "XKeep", 0.09);
+minEEDist = getOpt(opts, "MinEEDist", 0.18);
+
+if mode == "strict"
+    elbowOutSoftW = 1.6;
+    elbowOutHard = 0.010;
+    collisionMargin = 0.016;
+    broadMargin = 0.09;
+else
+    elbowOutSoftW = 0.45;
+    elbowOutHard = -0.020;  % effectively soft in bootstrap
+    collisionMargin = 0.000; % loose first-stage gate
+    broadMargin = 0.12;
+end
+
 numEvalTraj = getOpt(opts, "NumEvalTraj", 0);
 
-%% -------------------------- PATH / LOAD ----------------------------
+%% -------------------------- path / load --------------------------
 baseDir = fileparts(mfilename("fullpath"));
 oldDir = pwd;
 cleanup = onCleanup(@() cd(oldDir)); %#ok<NASGU>
 cd(baseDir);
 addpath(genpath(baseDir));
 
-[robotRaw, eeNameRaw, qHome] = loadRobotAutoEE(baseDir);
+[robotRaw, eeRaw, qHome] = loadRobotAutoEE(baseDir);
+
+[robotL, robotR] = placeDualRobots(robotRaw, baseLeftXYZ, baseRightXYZ);
+eeL = resolveEEName(robotL, eeRaw);
+eeR = resolveEEName(robotR, eeRaw);
+
+[shL, elL] = pickShoulderElbowBodies(robotL);
+[shR, elR] = pickShoulderElbowBodies(robotR);
+
+ikL = makeIKBackend(robotL);
+ikR = makeIKBackend(robotR);
+
+armBodiesL = pickArmBodies(robotL);
+armBodiesR = pickArmBodies(robotR);
+radMapL = buildArmCapsuleRadiusMap(armBodiesL);
+radMapR = buildArmCapsuleRadiusMap(armBodiesR);
 
 if verbose
-    fprintf("[dual_target_workspace] Seed=%d | N=%d | EE(raw)=%s\n", seed, N, eeNameRaw);
+    fprintf("\n[dual_target_workspace] Seed=%d mode=%s N=%d\n", seed, mode, N);
+    fprintf("  IK backend L=%s R=%s\n", ikL.Mode, ikR.Mode);
+    fprintf("  Base L=(%.3f %.3f %.3f) R=(%.3f %.3f %.3f)\n", baseLeftXYZ, baseRightXYZ);
 end
 
-%% ------------------------ SCENARIO CANDIDATES ----------------------
-% Each scenario moves only BASE / workspace CENTER (size fixed).
-scenarioLib = makeScenarioLibrary();
-scenarioCount = min(maxScenarioSelectTries, numel(scenarioLib));
-
-bestScenario = struct();
-scenarioFound = false;
-
-for sIdx = 1:scenarioCount
-    S = scenarioLib(sIdx);
-
-    [robotL, robotR] = placeDualRobots(robotRaw, S.BaseLeftXYZ, S.BaseRightXYZ);
-
-    eeNameL = resolveEEName(robotL, eeNameRaw);
-    eeNameR = resolveEEName(robotR, eeNameRaw);
-
-    [shL, elL] = pickShoulderElbowBodies(robotL);
-    [shR, elR] = pickShoulderElbowBodies(robotR);
-
-    ikL = makeIKBackend(robotL);
-    ikR = makeIKBackend(robotR);
-
-    armBodiesL = pickArmBodies(robotL);
-    armBodiesR = pickArmBodies(robotR);
-    radL = buildArmCapsuleRadiusMap(armBodiesL);
-    radR = buildArmCapsuleRadiusMap(armBodiesR);
-
-    % Fast feasibility probe: find a few reachable anchors on each arm.
-    reachOpts = struct( ...
-        "AnchorCount", 4, ...
-        "MaxSamples", 80, ...
-        "XKeep", xKeep, ...
-        "ElbowOutMarginLocal", elbowOutMarginLocal, ...
-        "ElbowOutMarginCenter", elbowOutMarginCenter, ...
-        "ElbowUpMargin", elbowUpMargin);
-
-    [aL, qAL, statL] = findReachableAnchors(robotL, ikL, eeNameL, qHome, S.WorkspaceCenter, ellABC, -1, shL, elL, reachOpts);
-    [aR, qAR, statR] = findReachableAnchors(robotR, ikR, eeNameR, qHome, S.WorkspaceCenter, ellABC, +1, shR, elR, reachOpts);
-
-    if verbose
-        fprintf("[scenario %d/%d] baseL=(%.2f %.2f %.2f) baseR=(%.2f %.2f %.2f) ws=(%.2f %.2f %.2f) | reach L=%d/%d R=%d/%d\n", ...
-            sIdx, scenarioCount, S.BaseLeftXYZ, S.BaseRightXYZ, S.WorkspaceCenter, ...
-            statL.Accepted, statL.Tested, statR.Accepted, statR.Tested);
-    end
-
-    if numel(aL) >= 4 && numel(aR) >= 4
-        scenarioFound = true;
-        bestScenario = S;
-        bestScenario.robotL = robotL;
-        bestScenario.robotR = robotR;
-        bestScenario.eeNameL = eeNameL;
-        bestScenario.eeNameR = eeNameR;
-        bestScenario.ikL = ikL;
-        bestScenario.ikR = ikR;
-        bestScenario.shL = shL; bestScenario.elL = elL;
-        bestScenario.shR = shR; bestScenario.elR = elR;
-        bestScenario.armBodiesL = armBodiesL; bestScenario.armBodiesR = armBodiesR;
-        bestScenario.radL = radL; bestScenario.radR = radR;
-        bestScenario.anchorL = aL; bestScenario.anchorR = aR;
-        bestScenario.anchorQL = qAL; bestScenario.anchorQR = qAR;
-        break;
-    end
+%% -------------------- EE frame quick diagnostics --------------------
+TL0 = getTransform(robotL, qHome, eeL);
+TR0 = getTransform(robotR, qHome, eeR);
+if verbose
+    fprintf("  EE(L)='%s' neutral pos=(%.3f %.3f %.3f) zAxis=(%.2f %.2f %.2f)\n", eeL, TL0(1:3,4), TL0(1:3,3));
+    fprintf("  EE(R)='%s' neutral pos=(%.3f %.3f %.3f) zAxis=(%.2f %.2f %.2f)\n", eeR, TR0(1:3,4), TR0(1:3,3));
 end
 
-if ~scenarioFound
-    error("No feasible base/workspace scenario found. Please increase scenario library coverage.");
+%% -------------------- center selection (bootstrap) --------------------
+if isempty(userCenter)
+    centerAuto = 0.5*(TL0(1:3,4).' + TR0(1:3,4).') + [0.00, 0.05, 0.00];
+else
+    centerAuto = userCenter;
+end
+
+% Optional old-style scenario search can be enabled, but default is OFF.
+if useScenarioSearch
+    [centerSel, scenarioLog] = optionalScenarioCenterSearch(robotL,robotR,ikL,ikR,eeL,eeR,qHome,centerAuto,ellABC,xKeep,coarseSamplesPerArm,coarseScanCenters,verbose);
+else
+    [centerSel, scenarioLog] = fallbackCenterScan(robotL,robotR,ikL,ikR,eeL,eeR,qHome,centerAuto,ellABC,xKeep,coarseSamplesPerArm,coarseScanCenters,verbose);
 end
 
 if verbose
-    fprintf("[selected] baseL=(%.3f %.3f %.3f) baseR=(%.3f %.3f %.3f) wsCenter=(%.3f %.3f %.3f) size=[%.3f %.3f %.3f]\n", ...
-        bestScenario.BaseLeftXYZ, bestScenario.BaseRightXYZ, bestScenario.WorkspaceCenter, ellABC);
+    fprintf("  Selected workspace center=(%.3f %.3f %.3f), score=%.3f\n", centerSel, scenarioLog.BestScore);
 end
 
-%% ----------------------- TRAJECTORY SYNTHESIS ----------------------
-Q1 = []; Q2 = []; P1 = []; P2 = []; trajMeta = struct();
+%% -------------------- quick IK residual probe --------------------
+pProbeL = centerSel + [-0.12, -0.02, 0.00];
+pProbeR = centerSel + [+0.12, +0.02, 0.00];
+[qProbeL, okProbeL, infoProbeL] = solveIKPoint(robotL, ikL, eeL, pProbeL, qHome, qHome, -1, shL, elL, elbowOutSoftW);
+[qProbeR, okProbeR, infoProbeR] = solveIKPoint(robotR, ikR, eeR, pProbeR, qHome, qHome, +1, shR, elR, elbowOutSoftW);
+if verbose
+    fprintf("  Probe IK: L ok=%d residual=%.4f | R ok=%d residual=%.4f\n", okProbeL, infoProbeL.PosErr, okProbeR, infoProbeR.PosErr);
+end
+
+%% -------------------- reachable anchors --------------------
+reachOpt = struct("Samples", 60, "Needed", anchorNeeded, "XKeep", xKeep, "ElbowOutSoftW", elbowOutSoftW);
+[aL, qAL, rStatL] = collectReachableAnchors(robotL, ikL, eeL, qHome, centerSel, ellABC, -1, shL, elL, reachOpt);
+[aR, qAR, rStatR] = collectReachableAnchors(robotR, ikR, eeR, qHome, centerSel, ellABC, +1, shR, elR, reachOpt);
+
+if verbose
+    fprintf("  Reachability: L %d/%d (mean residual=%.4f), R %d/%d (mean residual=%.4f)\n", ...
+        rStatL.Success, rStatL.Tested, rStatL.MeanResidual, rStatR.Success, rStatR.Tested, rStatR.MeanResidual);
+end
+
+if numel(aL) < anchorNeeded || numel(aR) < anchorNeeded
+    error("Reachability too low after fallback scan. Cause: center/base likely unreachable or IK solver not converging.");
+end
+
+%% -------------------- build & solve trajectory --------------------
+Q1 = []; Q2 = []; P1 = []; P2 = []; meta = struct();
 finalDiag = struct();
 
-for attempt = 1:maxTrajTriesPerScenario
-    [P1cand, P2cand, meta] = buildDistinctCartesianTraj(bestScenario.anchorL, bestScenario.anchorR, N, bestScenario.WorkspaceCenter, ellABC, xKeep, attempt);
+for attempt = 1:maxTrajAttempts
+    [P1c, P2c, metaC] = generateDualTrajectory(aL, aR, N, centerSel, ellABC, xKeep, minEEDist, mode, attempt);
 
-    % Early Cartesian gates
-    if any(P1cand(:,1) > -xKeep) || any(P2cand(:,1) < +xKeep)
-        continue;
-    end
-    if any(vecnorm(P1cand - P2cand,2,2) < minEEDist)
+    if any(vecnorm(P1c-P2c,2,2) < minEEDist)
         continue;
     end
 
-    % Sequential IK with previous-step continuity seeds.
-    ikRunOpts = struct( ...
-        "ElbowOutMarginLocal", elbowOutMarginLocal, ...
-        "ElbowOutMarginCenter", elbowOutMarginCenter, ...
-        "ElbowUpMargin", elbowUpMargin, ...
-        "XKeep", xKeep);
+    [Q1c, stL] = solveTrajectorySequence(robotL, ikL, eeL, P1c, qHome, qAL, -1, shL, elL, elbowOutSoftW);
+    [Q2c, stR] = solveTrajectorySequence(robotR, ikR, eeR, P2c, qHome, qAR, +1, shR, elR, elbowOutSoftW);
 
-    [Q1cand, ikStatL] = solveTrajectoryIK(bestScenario.robotL, bestScenario.ikL, bestScenario.eeNameL, P1cand, ...
-        qHome, bestScenario.anchorQL, bestScenario.shL, bestScenario.elL, -1, ikRunOpts);
-    [Q2cand, ikStatR] = solveTrajectoryIK(bestScenario.robotR, bestScenario.ikR, bestScenario.eeNameR, P2cand, ...
-        qHome, bestScenario.anchorQR, bestScenario.shR, bestScenario.elR, +1, ikRunOpts);
-
-    ikRate = 0.5*(ikStatL.SuccessRate + ikStatR.SuccessRate);
-    if ikRate < 0.92
-        if verbose && mod(attempt,10)==0
-            fprintf("[traj %d/%d] IK low success L=%.1f%% R=%.1f%%\n", attempt, maxTrajTriesPerScenario, 100*ikStatL.SuccessRate, 100*ikStatR.SuccessRate);
+    if stL.SuccessRate < 0.80 || stR.SuccessRate < 0.80
+        if verbose && mod(attempt,8)==0
+            fprintf("  [attempt %d] IK low: L=%.1f%% R=%.1f%%\n", attempt, 100*stL.SuccessRate, 100*stR.SuccessRate);
         end
         continue;
     end
 
-    % Hard arm-arm collision gate at final stage.
-    [isCol, colInfo] = trajectoryArmCollision(bestScenario.robotL, Q1cand, bestScenario.armBodiesL, bestScenario.radL, ...
-        bestScenario.robotR, Q2cand, bestScenario.armBodiesR, bestScenario.radR, capsuleMargin, broadMargin);
-
+    [isCol, cInfo] = trajectoryArmCollision(robotL,Q1c,armBodiesL,radMapL,robotR,Q2c,armBodiesR,radMapR,collisionMargin,broadMargin);
     if isCol
         if verboseCollision
-            fprintf("[traj %d/%d] ArmArm collision t=%d pair=(%s <-> %s) d=%.4f thr=%.4f\n", ...
-                attempt, maxTrajTriesPerScenario, colInfo.t, colInfo.linkL, colInfo.linkR, colInfo.d, colInfo.th);
+            fprintf("  [attempt %d] ArmArm collision t=%d pair=(%s <-> %s) d=%.4f th=%.4f\n", ...
+                attempt, cInfo.t, cInfo.linkL, cInfo.linkR, cInfo.d, cInfo.th);
         end
         continue;
     end
 
-    % Final posture metrics
-    mL = elbowMetrics(bestScenario.robotL, Q1cand, bestScenario.shL, bestScenario.elL, -1);
-    mR = elbowMetrics(bestScenario.robotR, Q2cand, bestScenario.shR, bestScenario.elR, +1);
+    mL = elbowMetrics(robotL,Q1c,shL,elL,-1);
+    mR = elbowMetrics(robotR,Q2c,shR,elR,+1);
 
-    if mL.KeepRatio < 0.85 || mR.KeepRatio < 0.85
-        continue;
+    if mode == "strict"
+        if mL.LocalMean < elbowOutHard || mR.LocalMean < elbowOutHard
+            continue;
+        end
     end
 
-    Q1 = Q1cand; Q2 = Q2cand; P1 = P1cand; P2 = P2cand; trajMeta = meta;
-    finalDiag.IKLeft = ikStatL; finalDiag.IKRight = ikStatR;
+    Q1 = Q1c; Q2 = Q2c; P1 = P1c; P2 = P2c; meta = metaC;
+    finalDiag.IKLeft = stL; finalDiag.IKRight = stR;
     finalDiag.ElbowLeft = mL; finalDiag.ElbowRight = mR;
-    finalDiag.CollisionPass = true;
-
-    if verbose
-        fprintf("[accepted] attempt=%d | IK L/R=%.1f%%/%.1f%% | elbow-out L/R=%.1f%%/%.1f%% | modeL=%s modeR=%s\n", ...
-            attempt, 100*ikStatL.SuccessRate, 100*ikStatR.SuccessRate, 100*mL.KeepRatio, 100*mR.KeepRatio, bestScenario.ikL.Mode, bestScenario.ikR.Mode);
-    end
     break;
 end
 
 if isempty(Q1)
-    error("Could not find valid trajectory. IK stage remains infeasible under current configuration.");
+    error("No trajectory accepted. Root-cause hint: likely IK convergence instability or unreachable center for one arm.");
 end
 
-%% -------------------- OPTIONAL MONTE-CARLO DIAG --------------------
+if verbose
+    fprintf("\n[success] IK L/R = %.1f%% / %.1f%% | elbow keep L/R = %.1f%% / %.1f%%\n", ...
+        100*finalDiag.IKLeft.SuccessRate, 100*finalDiag.IKRight.SuccessRate, ...
+        100*finalDiag.ElbowLeft.KeepRatio, 100*finalDiag.ElbowRight.KeepRatio);
+end
+
 if numEvalTraj > 0
-    evalRes = evaluateBatch(bestScenario, qHome, N, numEvalTraj, ellABC, xKeep, minEEDist, ...
-        elbowOutMarginLocal, elbowOutMarginCenter, elbowUpMargin, capsuleMargin, broadMargin);
-
-    fprintf("[diagnostics] batch=%d | IK success mean L/R=%.1f%% / %.1f%% | elbow keep L/R=%.1f%% / %.1f%% | arm-arm pass=%.1f%%\n", ...
-        numEvalTraj, 100*evalRes.IKRateL, 100*evalRes.IKRateR, 100*evalRes.ElbowKeepL, 100*evalRes.ElbowKeepR, 100*evalRes.CollisionPassRate);
+    ev = batchEval(robotL,robotR,ikL,ikR,eeL,eeR,qHome,aL,aR,qAL,qAR,shL,elL,shR,elR,centerSel,ellABC,mode,numEvalTraj,xKeep,minEEDist,armBodiesL,armBodiesR,radMapL,radMapR,collisionMargin,broadMargin,elbowOutSoftW);
+    fprintf("[batch] IK mean L/R=%.1f%% / %.1f%% | elbow keep L/R=%.1f%% / %.1f%% | arm-arm pass=%.1f%%\n", ...
+        100*ev.IKRateL,100*ev.IKRateR,100*ev.ElbowKeepL,100*ev.ElbowKeepR,100*ev.CollisionPass);
 end
 
-%% --------------------------- VISUALIZE -----------------------------
-visualizeDual(bestScenario, Q1, Q2, P1, P2, ellABC, trajMeta, fps);
+visualizeDual(robotL,robotR,Q1,Q2,P1,P2,centerSel,ellABC,meta,fps);
 
 end
 
-%% ==================================================================
-%%                             HELPERS
-%% ==================================================================
+%% =====================================================================
+%%                               HELPERS
+%% =====================================================================
 
-function scenarioLib = makeScenarioLibrary()
-% Workspace size fixed. We explore only center position + base placements.
-% Values chosen to prioritize reachability first, then collision margin.
-
-scenarioLib = struct([]);
-
-scenarioLib(1).BaseLeftXYZ  = [-0.34, -0.11, 0.00];
-scenarioLib(1).BaseRightXYZ = [+0.34, +0.11, 0.00];
-scenarioLib(1).WorkspaceCenter = [0.00, 0.58, 0.30];
-
-scenarioLib(2).BaseLeftXYZ  = [-0.31, -0.14, 0.00];
-scenarioLib(2).BaseRightXYZ = [+0.31, +0.14, 0.00];
-scenarioLib(2).WorkspaceCenter = [0.00, 0.54, 0.28];
-
-scenarioLib(3).BaseLeftXYZ  = [-0.36, -0.08, 0.00];
-scenarioLib(3).BaseRightXYZ = [+0.36, +0.08, 0.00];
-scenarioLib(3).WorkspaceCenter = [0.00, 0.62, 0.32];
+function [centerSel, logOut] = optionalScenarioCenterSearch(robotL,robotR,ikL,ikR,eeL,eeR,qHome,center0,ellABC,xKeep,coarseSamples,scanN,verbose)
+% Kept for compatibility. Now delegates to lightweight fallback scan.
+[centerSel, logOut] = fallbackCenterScan(robotL,robotR,ikL,ikR,eeL,eeR,qHome,center0,ellABC,xKeep,coarseSamples,scanN,verbose);
 end
 
-function [robotL, robotR] = placeDualRobots(robotRaw, baseL, baseR)
-TL = trvec2tform(baseL);
-TR = trvec2tform(baseR);
-robotL = makePlacedRobot(robotRaw, TL);
-robotR = makePlacedRobot(robotRaw, TR);
+function [centerBest, logOut] = fallbackCenterScan(robotL,robotR,ikL,ikR,eeL,eeR,qHome,center0,ellABC,xKeep,coarseSamples,scanN,verbose)
+% Data-driven center scan:
+% 1) Build candidate centers around neutral-FK-based center.
+% 2) Coarse IK success test (10-ish samples per arm) for each center.
+% 3) Choose best center with highest bilateral reach score.
+
+cand = generateCenterCandidates(center0, scanN);
+score = -inf(size(cand,1),1);
+
+bestMeanResidual = inf;
+for i = 1:size(cand,1)
+    c = cand(i,:);
+    [sL, rL] = coarseReachScore(robotL,ikL,eeL,qHome,c,ellABC,-1,xKeep,coarseSamples);
+    [sR, rR] = coarseReachScore(robotR,ikR,eeR,qHome,c,ellABC,+1,xKeep,coarseSamples);
+
+    % bilateral score: both arms must be good.
+    score(i) = min(sL,sR) + 0.25*(sL+sR);
+    meanRes = 0.5*(rL+rR);
+
+    if score(i) > max(score(1:i))
+        bestMeanResidual = meanRes;
+    end
+
+    if verbose
+        fprintf("  [center scan %02d] c=(%.3f %.3f %.3f) reachL=%.2f reachR=%.2f meanRes=%.4f\n", i, c, sL, sR, meanRes);
+    end
 end
 
-function eeName = resolveEEName(robot, eeNameRaw)
-if any(strcmp(robot.BodyNames, eeNameRaw))
-    eeName = eeNameRaw;
-else
-    eeName = robot.BodyNames{end};
+[~, idx] = max(score);
+centerBest = cand(idx,:);
+
+logOut = struct();
+logOut.BestScore = score(idx);
+logOut.BestMeanResidual = bestMeanResidual;
+end
+
+function cand = generateCenterCandidates(c0, n)
+% lightweight y/z sweep around c0
+if n < 4
+    n = 4;
+end
+
+cand = zeros(n,3);
+cand(1,:) = c0;
+
+k = 2;
+for dy = [-0.10 -0.06 -0.03 0 0.03 0.06 0.10]
+    for dz = [-0.08 -0.04 0 0.04 0.08]
+        if k > n
+            return;
+        end
+        cand(k,:) = c0 + [0, dy, dz];
+        k = k + 1;
+    end
+end
+
+while k <= n
+    cand(k,:) = c0 + [0, 0.02*randn(), 0.02*randn()];
+    k = k + 1;
 end
 end
 
-function ik = makeIKBackend(robot)
-ik = struct();
-ik.Robot = robot;
-
-if exist('inverseKinematics','class') > 0
-    ik.Mode = "inverseKinematics";
-    ik.Obj  = inverseKinematics("RigidBodyTree", robot);
-else
-    ik.Mode = "numericFallback";
-    ik.Obj  = [];
+function [ratio, meanResidual] = coarseReachScore(robot,ik,eeName,qHome,center,abc,sideSign,xKeep,samples)
+okN = 0;
+res = nan(samples,1);
+qPrev = qHome;
+for i = 1:samples
+    p = samplePointInEllipsoid(center, abc, 0.65);
+    p(1) = sideSign*max(abs(p(1)), xKeep);
+    [q, ok, info] = solveIKPoint(robot,ik,eeName,p,qPrev,qHome,sideSign,'','',0.0);
+    if ok
+        okN = okN + 1;
+        qPrev = q;
+        res(i) = info.PosErr;
+    end
+end
+ratio = okN/max(1,samples);
+meanResidual = mean(res(~isnan(res)));
+if ~isfinite(meanResidual)
+    meanResidual = 1e3;
 end
 end
 
-function [anchors, anchorQ, stat] = findReachableAnchors(robot, ik, eeName, qHome, center, abc, sideSign, shoulderBody, elbowBody, opts)
-needCount = getOpt(opts, "AnchorCount", 4);
-maxSamples = getOpt(opts, "MaxSamples", 70);
-xKeep = getOpt(opts, "XKeep", 0.10);
-
-outLocal = getOpt(opts, "ElbowOutMarginLocal", 0.0);
-outCenter = getOpt(opts, "ElbowOutMarginCenter", 0.0);
-upMargin = getOpt(opts, "ElbowUpMargin", -0.02);
+function [anchors, anchorQ, stat] = collectReachableAnchors(robot,ik,eeName,qHome,center,abc,sideSign,shBody,elBody,opt)
+samples = getOpt(opt,"Samples",60);
+needed = getOpt(opt,"Needed",3);
+xKeep = getOpt(opt,"XKeep",0.09);
+elbowW = getOpt(opt,"ElbowOutSoftW",0.3);
 
 anchors = {};
 anchorQ = {};
-
-tested = 0;
-accepted = 0;
 qPrev = qHome;
+residuals = [];
 
-for i = 1:maxSamples
-    tested = tested + 1;
-
+for i = 1:samples
     p = samplePointInEllipsoid(center, abc, 0.80);
     p(1) = sideSign*max(abs(p(1)), xKeep);
 
-    if sideSign < 0
-        p(2) = p(2) - 0.04;
-    else
-        p(2) = p(2) + 0.04;
+    seedAlt = perturbSeed(qPrev, 0.16);
+    [q1, ok1, info1] = solveIKPoint(robot,ik,eeName,p,qPrev,qHome,sideSign,shBody,elBody,elbowW);
+    [q2, ok2, info2] = solveIKPoint(robot,ik,eeName,p,seedAlt,qHome,sideSign,shBody,elBody,elbowW);
+
+    q = q1; ok = ok1; info = info1;
+    if ok2 && (~ok1 || info2.Score < info1.Score)
+        q = q2; ok = ok2; info = info2;
     end
 
-    seedPool = {qPrev, qHome, perturbSeed(qPrev, 0.20), perturbSeed(qHome, 0.30)};
-    [q, ok, info] = solvePoseWithSeeds(robot, ik, eeName, p, qPrev, sideSign, shoulderBody, elbowBody, seedPool);
-
-    if ~ok || info.PosErr > 0.03
+    if ~ok || info.PosErr > 0.05
         continue;
     end
 
-    [elLocal, elCenter, elUp] = elbowScalars(robot, q, shoulderBody, elbowBody, sideSign);
-    if elLocal < outLocal || elCenter < outCenter || elUp < upMargin
-        continue;
-    end
-
-    accepted = accepted + 1;
     anchors{end+1} = p; %#ok<AGROW>
     anchorQ{end+1} = q; %#ok<AGROW>
+    residuals(end+1) = info.PosErr; %#ok<AGROW>
     qPrev = q;
 
-    if accepted >= needCount
+    if numel(anchors) >= needed
         break;
     end
 end
 
 stat = struct();
-stat.Tested = tested;
-stat.Accepted = accepted;
+stat.Tested = samples;
+stat.Success = numel(anchors);
+if isempty(residuals)
+    stat.MeanResidual = inf;
+else
+    stat.MeanResidual = mean(residuals);
+end
 end
 
-function [P1, P2, meta] = buildDistinctCartesianTraj(anchorL, anchorR, N, center, abc, xKeep, attempt)
+function [q, ok, info] = solveIKPoint(robot,ik,eeName,pGoal,qSeed,qRef,sideSign,shBody,elBody,elbowOutSoftW)
+% Success-first IK point solver:
+% - position-priority IK
+% - mild soft elbow-out penalty (can be zero)
+
+Tgoal = [eye(3), pGoal(:); 0 0 0 1];
+seedPool = {qSeed, qRef, perturbSeed(qSeed,0.20)};
+
+bestScore = inf;
+bestQ = qSeed;
+bestErr = inf;
+
+for i = 1:numel(seedPool)
+    q0 = seedPool{i};
+    [qCand, solved] = solveSingleIK(robot,ik,eeName,Tgoal,q0);
+    if ~solved || any(~isfinite(qCand))
+        continue;
+    end
+
+    Tcur = getTransform(robot, qCand, eeName);
+    posErr = norm(Tcur(1:3,4).' - pGoal, 2);
+
+    elbowPenalty = 0;
+    if ~isempty(shBody) && ~isempty(elBody)
+        [elLocal, elCenter] = elbowOutScalars(robot,qCand,shBody,elBody,sideSign);
+        elbowPenalty = softplus(0.006-elLocal,35) + 0.8*softplus(0.008-elCenter,30);
+    end
+
+    score = 18*posErr + elbowOutSoftW*elbowPenalty + 0.03*norm(qCand-qRef)^2;
+
+    if score < bestScore
+        bestScore = score;
+        bestQ = qCand;
+        bestErr = posErr;
+    end
+end
+
+q = bestQ;
+ok = isfinite(bestErr) && bestErr < 0.06;
+info = struct('PosErr',bestErr,'Score',bestScore);
+end
+
+function [Q, stat] = solveTrajectorySequence(robot,ik,eeName,P,qHome,anchorQ,sideSign,shBody,elBody,elbowOutSoftW)
+N = size(P,1);
+Q = zeros(N, numel(qHome));
+succ = false(N,1);
+res = nan(N,1);
+
+qPrev = qHome;
+for k = 1:N
+    idx = 1 + mod(k-1, numel(anchorQ));
+    qA = anchorQ{idx};
+
+    [q, ok, info] = solveIKPoint(robot,ik,eeName,P(k,:),qPrev,qA,sideSign,shBody,elBody,elbowOutSoftW);
+
+    if ok
+        Q(k,:) = q;
+        qPrev = q;
+        succ(k) = true;
+        res(k) = info.PosErr;
+    else
+        if k == 1
+            Q(k,:) = qHome;
+        else
+            Q(k,:) = Q(k-1,:);
+        end
+        qPrev = Q(k,:);
+    end
+end
+
+% one lightweight repair pass on failures
+bad = find(~succ);
+for i = 1:numel(bad)
+    k = bad(i);
+    qN = neighborSeed(Q,k,qHome);
+    [q, ok, info] = solveIKPoint(robot,ik,eeName,P(k,:),qN,qHome,sideSign,shBody,elBody,elbowOutSoftW);
+    if ok
+        Q(k,:) = q;
+        succ(k) = true;
+        res(k) = info.PosErr;
+    end
+end
+
+stat = struct();
+stat.SuccessRate = mean(succ);
+stat.SuccessMask = succ;
+stat.MeanResidual = mean(res(succ));
+if ~isfinite(stat.MeanResidual)
+    stat.MeanResidual = inf;
+end
+end
+
+function [P1,P2,meta] = generateDualTrajectory(anchorL,anchorR,N,center,abc,xKeep,minEEDist,mode,attempt)
 A1 = cell2mat(anchorL(:));
 A2 = cell2mat(anchorR(:));
-
-% Ensure loop continuity by closing with first anchor.
 A1 = [A1; A1(1,:)];
 A2 = [A2; A2(1,:)];
 
-k1 = size(A1,1);
-k2 = size(A2,1);
-t1 = linspace(0,1,k1);
-t2 = linspace(0,1,k2);
-
-t = linspace(0,1,N).';
-
-% Distinct profiles and speeds
-speedL = 0.92 + 0.18*rand();
-speedR = 1.10 + 0.30*rand();
-phase = 0.18 + 0.24*rand();
-
-uL = mod(speedL*t, 1.0);
-uR = mod(speedR*t + phase, 1.0);
-
-tauL = 0.5 - 0.5*cos(pi*uL);      % sine-ease
-tauR = trapezoidWarp(uR, 0.18, 0.72); % trapezoid-like
-
-% Reorder anchors slightly over attempts to avoid repeated failures.
-if mod(attempt,3)==2
-    A2 = circshift(A2, 1, 1);
-elseif mod(attempt,3)==0
-    A1 = circshift(A1, 1, 1);
+if mod(attempt,2)==0
+    A2 = circshift(A2,1,1);
 end
 
-P1 = [interp1(t1, A1(:,1), tauL, 'pchip'), interp1(t1, A1(:,2), tauL, 'pchip'), interp1(t1, A1(:,3), tauL, 'pchip')];
-P2 = [interp1(t2, A2(:,1), tauR, 'pchip'), interp1(t2, A2(:,2), tauR, 'pchip'), interp1(t2, A2(:,3), tauR, 'pchip')];
+t = linspace(0,1,N).';
+t1 = linspace(0,1,size(A1,1));
+t2 = linspace(0,1,size(A2,1));
 
-[P1, P2] = clampInsideEllipsoid(P1, P2, center, abc, 0.94);
+if mode == "strict"
+    vL = 0.88 + 0.18*rand();
+    vR = 1.05 + 0.35*rand();
+    ph = 0.20 + 0.20*rand();
+    uL = mod(vL*t,1.0);
+    uR = mod(vR*t+ph,1.0);
+    tauL = 0.5 - 0.5*cos(pi*uL);
+    tauR = trapezoidWarp(uR,0.16,0.72);
+else
+    % bootstrap: still different, but simpler and easier to solve
+    vL = 0.95;
+    vR = 1.10;
+    ph = 0.16;
+    uL = mod(vL*t,1.0);
+    uR = mod(vR*t+ph,1.0);
+    tauL = uL;
+    tauR = 0.5 - 0.5*cos(pi*uR);
+end
+
+P1 = [interp1(t1,A1(:,1),tauL,'pchip'), interp1(t1,A1(:,2),tauL,'pchip'), interp1(t1,A1(:,3),tauL,'pchip')];
+P2 = [interp1(t2,A2(:,1),tauR,'pchip'), interp1(t2,A2(:,2),tauR,'pchip'), interp1(t2,A2(:,3),tauR,'pchip')];
+
+[P1,P2] = clampInsideEllipsoid(P1,P2,center,abc,0.95);
 P1(:,1) = min(P1(:,1), -xKeep);
 P2(:,1) = max(P2(:,1), +xKeep);
 
-meta = struct();
-meta.LeftSpeed = speedL;
-meta.RightSpeed = speedR;
-meta.Phase = phase;
-meta.LeftProfile = "sine-ease";
-meta.RightProfile = "trapezoid-warp";
+% If still too close, shift y slightly apart
+closeIdx = vecnorm(P1-P2,2,2) < minEEDist;
+if any(closeIdx)
+    P1(closeIdx,2) = P1(closeIdx,2) - 0.03;
+    P2(closeIdx,2) = P2(closeIdx,2) + 0.03;
 end
 
-function tau = trapezoidWarp(u, aFrac, dStart)
+meta = struct('LeftSpeed',vL,'RightSpeed',vR,'Phase',ph,'Mode',mode);
+end
+
+function tau = trapezoidWarp(u,aFrac,dStart)
 u = max(0,min(1,u));
 tau = zeros(size(u));
-
 i1 = (u < aFrac);
 i2 = (u >= aFrac) & (u <= dStart);
 i3 = (u > dStart);
-
 if any(i1)
     s = u(i1)/max(aFrac,1e-6);
     tau(i1) = 0.5*aFrac*s.^2;
@@ -398,352 +506,171 @@ if any(i3)
     y0 = 0.5*aFrac + (dStart-aFrac);
     tau(i3) = y0 + d*(s - 0.5*s.^2);
 end
-
 tau = tau - min(tau);
-tau = tau ./ max(max(tau),1e-9);
+tau = tau / max(max(tau),1e-9);
 end
 
-function [Q, stat] = solveTrajectoryIK(robot, ik, eeName, P, qHome, anchorQ, shoulderBody, elbowBody, sideSign, opts)
-N = size(P,1);
-nd = numel(qHome);
-Q = zeros(N, nd);
-
-qPrev = qHome;
-succ = false(N,1);
-posErr = inf(N,1);
-
+function [isCol, info] = trajectoryArmCollision(robotL,QL,armBodiesL,radL,robotR,QR,armBodiesR,radR,margin,broadMargin)
+isCol = false;
+info = struct('t',-1,'linkL','','linkR','','d',nan,'th',nan);
+N = size(QL,1);
 for k = 1:N
-    p = P(k,:);
-
-    idxA = 1 + mod(k-1, numel(anchorQ));
-    qA = anchorQ{idxA};
-
-    seedPool = {
-        qPrev, ...
-        qA, ...
-        qHome, ...
-        perturbSeed(qPrev, 0.12), ...
-        perturbSeed(qA, 0.18), ...
-        perturbSeed(qHome, 0.25)};
-
-    [q, ok, info] = solvePoseWithSeeds(robot, ik, eeName, p, qPrev, sideSign, shoulderBody, elbowBody, seedPool);
-
-    if ok
-        Q(k,:) = q;
-        qPrev = q;
-        succ(k) = true;
-        posErr(k) = info.PosErr;
-    else
-        % continuity-preserving fallback: keep last valid
-        if k == 1
-            Q(k,:) = qHome;
-        else
-            Q(k,:) = Q(k-1,:);
-        end
-        qPrev = Q(k,:);
+    [col, c] = armArmCapsuleCollision(robotL,QL(k,:),armBodiesL,radL,robotR,QR(k,:),armBodiesR,radR,margin,broadMargin);
+    if col
+        isCol = true;
+        info.t = k;
+        info.linkL = c.Link1;
+        info.linkR = c.Link2;
+        info.d = c.Distance;
+        info.th = c.Threshold;
+        return;
     end
 end
-
-stat = struct();
-stat.SuccessMask = succ;
-stat.SuccessRate = mean(succ);
-stat.MeanPosErr = mean(posErr(succ));
-if ~isfinite(stat.MeanPosErr), stat.MeanPosErr = inf; end
-
-% soft recover pass: re-solve failed frames with neighbor seed blending
-badIdx = find(~succ);
-for i = 1:numel(badIdx)
-    k = badIdx(i);
-    p = P(k,:);
-    qN = neighborSeed(Q, k, qHome);
-    seedPool = {qN, qHome, perturbSeed(qN,0.18)};
-    [q, ok, info] = solvePoseWithSeeds(robot, ik, eeName, p, qN, sideSign, shoulderBody, elbowBody, seedPool);
-    if ok
-        Q(k,:) = q;
-        succ(k) = true;
-        posErr(k) = info.PosErr;
-    end
 end
 
-stat.SuccessMask = succ;
-stat.SuccessRate = mean(succ);
-stat.MeanPosErr = mean(posErr(succ));
-if ~isfinite(stat.MeanPosErr), stat.MeanPosErr = inf; end
-end
-
-function q0 = neighborSeed(Q, k, qHome)
+function m = elbowMetrics(robot,Q,shoulderBody,elbowBody,sideSign)
 N = size(Q,1);
-if k > 1 && k < N
-    q0 = 0.5*(Q(k-1,:) + Q(k+1,:));
-elseif k > 1
+outLocal = zeros(N,1);
+outCenter = zeros(N,1);
+for k = 1:N
+    [outLocal(k), outCenter(k)] = elbowOutScalars(robot,Q(k,:),shoulderBody,elbowBody,sideSign);
+end
+keep = (outLocal > 0) & (outCenter > 0);
+m = struct('KeepRatio',mean(keep),'LocalMean',mean(outLocal),'CenterMean',mean(outCenter));
+end
+
+function [outLocal,outCenter] = elbowOutScalars(robot,q,shoulderBody,elbowBody,sideSign)
+if isempty(shoulderBody) || isempty(elbowBody)
+    outLocal = 0; outCenter = 0; return;
+end
+Tsh = getTransform(robot,q,shoulderBody);
+Tel = getTransform(robot,q,elbowBody);
+d = Tel(1:3,4)-Tsh(1:3,4);
+outLocal = sideSign*d(1);
+outCenter = sideSign*Tel(1,4);
+end
+
+function ev = batchEval(robotL,robotR,ikL,ikR,eeL,eeR,qHome,aL,aR,qAL,qAR,shL,elL,shR,elR,center,abc,mode,nEval,xKeep,minEEDist,armBodiesL,armBodiesR,radL,radR,margin,broadMargin,elbowOutSoftW)
+ikLsum = 0; ikRsum = 0; elLsum = 0; elRsum = 0; passCol=0;
+for i = 1:nEval
+    [P1,P2] = generateDualTrajectory(aL,aR,max(50,round(5*20)),center,abc,xKeep,minEEDist,mode,i);
+    [Q1,stL] = solveTrajectorySequence(robotL,ikL,eeL,P1,qHome,qAL,-1,shL,elL,elbowOutSoftW);
+    [Q2,stR] = solveTrajectorySequence(robotR,ikR,eeR,P2,qHome,qAR,+1,shR,elR,elbowOutSoftW);
+    mL = elbowMetrics(robotL,Q1,shL,elL,-1);
+    mR = elbowMetrics(robotR,Q2,shR,elR,+1);
+    [col,~] = trajectoryArmCollision(robotL,Q1,armBodiesL,radL,robotR,Q2,armBodiesR,radR,margin,broadMargin);
+    ikLsum = ikLsum + stL.SuccessRate;
+    ikRsum = ikRsum + stR.SuccessRate;
+    elLsum = elLsum + mL.KeepRatio;
+    elRsum = elRsum + mR.KeepRatio;
+    if ~col, passCol = passCol + 1; end
+end
+ev = struct('IKRateL',ikLsum/nEval,'IKRateR',ikRsum/nEval,'ElbowKeepL',elLsum/nEval,'ElbowKeepR',elRsum/nEval,'CollisionPass',passCol/nEval);
+end
+
+function visualizeDual(robotL,robotR,Q1,Q2,P1,P2,center,ellABC,meta,fps)
+fig = figure("Color","w");
+ax = axes(fig); hold(ax,"on");
+axis(ax,"equal"); grid(ax,"on");
+view(ax,35,20);
+xlabel(ax,"X [m]"); ylabel(ax,"Y [m]"); zlabel(ax,"Z [m]");
+
+plotEllipsoid(ax,center,ellABC(1),ellABC(2),ellABC(3));
+plot3(ax,P1(:,1),P1(:,2),P1(:,3),"-","Color",[0.1 0.3 0.9],"LineWidth",1.2);
+plot3(ax,P2(:,1),P2(:,2),P2(:,3),"-","Color",[0.9 0.2 0.2],"LineWidth",1.2);
+
+show(robotL,Q1(1,:),"Parent",ax,"PreservePlot",true,"Visuals","on","Frames","off");
+show(robotR,Q2(1,:),"Parent",ax,"PreservePlot",true,"Visuals","on","Frames","off");
+
+title(ax, sprintf("dual_target_workspace | mode=%s | vL=%.2f vR=%.2f phase=%.2f", meta.Mode, meta.LeftSpeed, meta.RightSpeed, meta.Phase));
+
+x0 = xlim(ax); y0 = ylim(ax); z0 = zlim(ax);
+rc = rateControl(fps);
+k=1; N = size(Q1,1);
+while ishandle(fig)
+    cla(ax); hold(ax,"on");
+    plotEllipsoid(ax,center,ellABC(1),ellABC(2),ellABC(3));
+    plot3(ax,P1(:,1),P1(:,2),P1(:,3),"-","Color",[0.1 0.3 0.9],"LineWidth",1.2);
+    plot3(ax,P2(:,1),P2(:,2),P2(:,3),"-","Color",[0.9 0.2 0.2],"LineWidth",1.2);
+    show(robotL,Q1(k,:),"Parent",ax,"PreservePlot",true,"Visuals","on","Frames","off");
+    show(robotR,Q2(k,:),"Parent",ax,"PreservePlot",true,"Visuals","on","Frames","off");
+    xlim(ax,x0); ylim(ax,y0); zlim(ax,z0);
+    drawnow;
+    waitfor(rc);
+    k = k + 1;
+    if k > N, k = 1; end
+end
+end
+
+function q0 = neighborSeed(Q,k,qHome)
+N = size(Q,1);
+if k>1 && k<N
+    q0 = 0.5*(Q(k-1,:)+Q(k+1,:));
+elseif k>1
     q0 = Q(k-1,:);
 else
     q0 = qHome;
 end
 end
 
-function [qBest, ok, infoBest] = solvePoseWithSeeds(robot, ik, eeName, pGoal, qPrev, sideSign, shoulderBody, elbowBody, seedPool)
-qBest = [];
-ok = false;
-infoBest = struct('PosErr',inf,'Score',inf);
-
-% Desired orientation: keep home-like but very low orientation weight.
-Rdes = eye(3);
-Tgoal = [Rdes, pGoal(:); 0 0 0 1];
-
-for i = 1:numel(seedPool)
-    q0 = seedPool{i};
-    [q, okSolve] = solveSingleIK(robot, ik, eeName, Tgoal, q0);
-    if ~okSolve
-        continue;
-    end
-
-    Tcur = getTransform(robot, q, eeName);
-    posErr = norm(Tcur(1:3,4).' - pGoal, 2);
-
-    [elLocal, elCenter, elUp] = elbowScalars(robot, q, shoulderBody, elbowBody, sideSign);
-
-    penOut = softplus(0.012 - elLocal, 40) + softplus(0.016 - elCenter, 40);
-    penUp  = softplus(-0.01 - elUp, 30);
-    smooth = 0.05*norm(q - qPrev)^2;
-
-    score = 20*posErr + 2.4*penOut + 0.8*penUp + smooth;
-
-    if score < infoBest.Score
-        qBest = q;
-        infoBest.PosErr = posErr;
-        infoBest.Score = score;
-        ok = (posErr < 0.035);
-    end
-end
-
-% Accept very best if moderately close.
-if ~ok && ~isempty(qBest)
-    ok = (infoBest.PosErr < 0.05);
-end
-end
-
-function y = softplus(x, beta)
-y = (1/beta)*log(1 + exp(beta*x));
-end
-
 function [q, ok] = solveSingleIK(robot, ik, eeName, Tgoal, q0)
-ok = false;
 q = q0;
+ok = false;
 
 if ik.Mode == "inverseKinematics"
-    % position-priority weights (orientation not strict)
-    w = [1 1 1 0.02 0.02 0.02];
+    w = [1 1 1 0.005 0.005 0.005]; % almost position-only
     [qCand, solInfo] = ik.Obj(eeName, Tgoal, w, q0);
-
     q = qCand;
     if isstruct(solInfo) && isfield(solInfo,'ExitFlag')
         ok = solInfo.ExitFlag > 0;
     else
         ok = all(isfinite(qCand));
     end
+    if ~ok
+        % retry with slightly stronger orientation damping and perturbed seed
+        q1 = q0 + 0.08*(2*rand(size(q0))-1);
+        [qCand2, info2] = ik.Obj(eeName, Tgoal, [1 1 1 0.001 0.001 0.001], q1);
+        q = qCand2;
+        if isstruct(info2) && isfield(info2,'ExitFlag')
+            ok = info2.ExitFlag > 0;
+        else
+            ok = all(isfinite(qCand2));
+        end
+    end
     return;
 end
 
-% Numeric fallback (fminsearch): position only
-obj = @(qq) positionOnlyObjective(robot, qq, eeName, Tgoal(1:3,4).');
-opts = optimset('Display','off','MaxIter',120);
+% fallback numeric (slow but robust for tiny-size usage)
+obj = @(qq) positionOnlyObjective(robot,qq,eeName,Tgoal(1:3,4).');
+opts = optimset('Display','off','MaxIter',80,'TolX',1e-4,'TolFun',1e-4);
 q = fminsearch(obj, q0, opts);
 ok = all(isfinite(q));
 end
 
-function [isCol, info] = trajectoryArmCollision(robotL, QL, armBodiesL, radL, robotR, QR, armBodiesR, radR, margin, broadMargin)
-isCol = false;
-info = struct('t',-1,'linkL','','linkR','','d',nan,'th',nan);
-N = size(QL,1);
-
-for k = 1:N
-    [col, cinfo] = armArmCapsuleCollision(robotL, QL(k,:), armBodiesL, radL, robotR, QR(k,:), armBodiesR, radR, margin, broadMargin);
-    if col
-        isCol = true;
-        info.t = k;
-        info.linkL = cinfo.Link1;
-        info.linkR = cinfo.Link2;
-        info.d = cinfo.Distance;
-        info.th = cinfo.Threshold;
-        return;
-    end
-end
+function y = softplus(x,beta)
+y = (1/beta)*log(1+exp(beta*x));
 end
 
-function m = elbowMetrics(robot, Q, shoulderBody, elbowBody, sideSign)
-N = size(Q,1);
-outLocal = zeros(N,1);
-outCenter = zeros(N,1);
-outUp = zeros(N,1);
-
-for k = 1:N
-    [outLocal(k), outCenter(k), outUp(k)] = elbowScalars(robot, Q(k,:), shoulderBody, elbowBody, sideSign);
-end
-
-keep = (outLocal > 0) & (outCenter > 0);
-
-m = struct();
-m.KeepRatio = mean(keep);
-m.LocalMean = mean(outLocal);
-m.CenterMean = mean(outCenter);
-m.UpMean = mean(outUp);
-end
-
-function [outLocal, outCenter, upVal] = elbowScalars(robot, q, shoulderBody, elbowBody, sideSign)
-Tsh = getTransform(robot, q, shoulderBody);
-Tel = getTransform(robot, q, elbowBody);
-
-d = Tel(1:3,4) - Tsh(1:3,4);
-outLocal = sideSign*d(1);
-outCenter = sideSign*Tel(1,4);
-upVal = d(3);
-end
-
-function evalRes = evaluateBatch(S, qHome, N, numEvalTraj, ellABC, xKeep, minEEDist, elbowOutLocal, elbowOutCenter, elbowUpMargin, capsuleMargin, broadMargin)
-passIKL = 0;
-passIKR = 0;
-passCol = 0;
-elKeepL = zeros(numEvalTraj,1);
-elKeepR = zeros(numEvalTraj,1);
-
-for i = 1:numEvalTraj
-    [P1, P2] = buildDistinctCartesianTraj(S.anchorL, S.anchorR, N, S.WorkspaceCenter, ellABC, xKeep, i);
-
-    if any(vecnorm(P1-P2,2,2) < minEEDist)
-        continue;
-    end
-
-    optsIK = struct("ElbowOutMarginLocal", elbowOutLocal, "ElbowOutMarginCenter", elbowOutCenter, "ElbowUpMargin", elbowUpMargin, "XKeep", xKeep);
-    [Q1, stL] = solveTrajectoryIK(S.robotL, S.ikL, S.eeNameL, P1, qHome, S.anchorQL, S.shL, S.elL, -1, optsIK);
-    [Q2, stR] = solveTrajectoryIK(S.robotR, S.ikR, S.eeNameR, P2, qHome, S.anchorQR, S.shR, S.elR, +1, optsIK);
-
-    passIKL = passIKL + stL.SuccessRate;
-    passIKR = passIKR + stR.SuccessRate;
-
-    mL = elbowMetrics(S.robotL, Q1, S.shL, S.elL, -1);
-    mR = elbowMetrics(S.robotR, Q2, S.shR, S.elR, +1);
-    elKeepL(i) = mL.KeepRatio;
-    elKeepR(i) = mR.KeepRatio;
-
-    [isCol, ~] = trajectoryArmCollision(S.robotL, Q1, S.armBodiesL, S.radL, S.robotR, Q2, S.armBodiesR, S.radR, capsuleMargin, broadMargin);
-    if ~isCol
-        passCol = passCol + 1;
-    end
-end
-
-evalRes = struct();
-evalRes.IKRateL = passIKL/numEvalTraj;
-evalRes.IKRateR = passIKR/numEvalTraj;
-evalRes.ElbowKeepL = mean(elKeepL);
-evalRes.ElbowKeepR = mean(elKeepR);
-evalRes.CollisionPassRate = passCol/numEvalTraj;
-end
-
-function visualizeDual(S, Q1, Q2, P1, P2, ellABC, trajMeta, fps)
-fig = figure("Color","w");
-ax = axes(fig); hold(ax,"on");
-axis(ax,"equal"); grid(ax,"on");
-view(ax, 35, 20);
-xlabel(ax,"X [m]"); ylabel(ax,"Y [m]"); zlabel(ax,"Z [m]");
-
-a = ellABC(1); b = ellABC(2); c = ellABC(3);
-plotEllipsoid(ax, S.WorkspaceCenter, a, b, c);
-plot3(ax, P1(:,1),P1(:,2),P1(:,3),"-","Color",[0.15 0.35 0.9],"LineWidth",1.2);
-plot3(ax, P2(:,1),P2(:,2),P2(:,3),"-","Color",[0.92 0.25 0.2],"LineWidth",1.2);
-
-show(S.robotL, Q1(1,:), "Parent", ax, "PreservePlot", true, "Visuals","on", "Frames","off");
-show(S.robotR, Q2(1,:), "Parent", ax, "PreservePlot", true, "Visuals","on", "Frames","off");
-
-title(ax, sprintf("Dual M1509 | L:%s %.2f  R:%s %.2f  phase=%.2f", ...
-    trajMeta.LeftProfile, trajMeta.LeftSpeed, trajMeta.RightProfile, trajMeta.RightSpeed, trajMeta.Phase));
-
-xlim0 = xlim(ax); ylim0 = ylim(ax); zlim0 = zlim(ax);
-rc = rateControl(fps);
-
-k = 1;
-N = size(Q1,1);
-while ishandle(fig)
-    cla(ax); hold(ax,"on");
-    plotEllipsoid(ax, S.WorkspaceCenter, a, b, c);
-    plot3(ax, P1(:,1),P1(:,2),P1(:,3),"-","Color",[0.15 0.35 0.9],"LineWidth",1.2);
-    plot3(ax, P2(:,1),P2(:,2),P2(:,3),"-","Color",[0.92 0.25 0.2],"LineWidth",1.2);
-
-    show(S.robotL, Q1(k,:), "Parent", ax, "PreservePlot", true, "Visuals","on", "Frames","off");
-    show(S.robotR, Q2(k,:), "Parent", ax, "PreservePlot", true, "Visuals","on", "Frames","off");
-
-    xlim(ax, xlim0); ylim(ax, ylim0); zlim(ax, zlim0);
-    drawnow;
-    waitfor(rc);
-
-    k = k + 1;
-    if k > N, k = 1; end
-end
-end
-
-function [p1, p2] = clampInsideEllipsoid(p1, p2, c0, abc, scale)
-a = abc(1); b = abc(2); c = abc(3);
-p1 = project(p1);
-p2 = project(p2);
-
-    function P = project(P)
-        X = (P(:,1)-c0(1))/a;
-        Y = (P(:,2)-c0(2))/b;
-        Z = (P(:,3)-c0(3))/c;
-        r2 = X.^2 + Y.^2 + Z.^2;
-        idx = r2 > scale^2;
-        if any(idx)
-            s = sqrt(r2(idx)) / scale;
-            X(idx) = X(idx)./s;
-            Y(idx) = Y(idx)./s;
-            Z(idx) = Z(idx)./s;
-            P(idx,1) = c0(1) + a*X(idx);
-            P(idx,2) = c0(2) + b*Y(idx);
-            P(idx,3) = c0(3) + c*Z(idx);
-        end
-    end
-end
-
-function p = samplePointInEllipsoid(center, abc, scale)
-a = abc(1)*scale; b = abc(2)*scale; c = abc(3)*scale;
-while true
-    x = (2*rand()-1)*a;
-    y = (2*rand()-1)*b;
-    z = (2*rand()-1)*c;
-    if (x/a)^2 + (y/b)^2 + (z/c)^2 <= 1
-        p = center + [x y z];
-        return;
-    end
-end
-end
-
-function qn = perturbSeed(q, sigma)
-qn = q + sigma*(2*rand(size(q))-1);
-end
-
-function [col, info] = armArmCapsuleCollision(robot1, q1, armBodies1, armRadMap1, robot2, q2, armBodies2, armRadMap2, margin, broadMargin)
+function [col, info] = armArmCapsuleCollision(robot1,q1,bodies1,rad1,robot2,q2,bodies2,rad2,margin,broadMargin)
 col = false;
-info = struct('Link1','', 'Link2','', 'Distance',nan, 'Threshold',nan);
+info = struct('Link1','','Link2','','Distance',nan,'Threshold',nan);
 
-caps1 = buildCapsulesAtConfig(robot1, q1, armBodies1, armRadMap1);
-caps2 = buildCapsulesAtConfig(robot2, q2, armBodies2, armRadMap2);
-
-if isempty(caps1) || isempty(caps2)
-    return;
-end
+caps1 = buildCapsulesAtConfig(robot1,q1,bodies1,rad1);
+caps2 = buildCapsulesAtConfig(robot2,q2,bodies2,rad2);
+if isempty(caps1) || isempty(caps2), return; end
 
 for i = 1:numel(caps1)
     c1 = caps1(i);
     for j = 1:numel(caps2)
         c2 = caps2(j);
 
-        midDist = norm(c1.mid - c2.mid);
+        midDist = norm(c1.mid-c2.mid);
         broadTh = c1.halfLen + c2.halfLen + c1.r + c2.r + margin + broadMargin;
         if midDist > broadTh
             continue;
         end
 
-        d = segmentSegmentDistance(c1.p0, c1.p1, c2.p0, c2.p1);
+        d = segmentSegmentDistance(c1.p0,c1.p1,c2.p0,c2.p1);
         th = c1.r + c2.r + margin;
         if d < th
             col = true;
@@ -757,136 +684,175 @@ for i = 1:numel(caps1)
 end
 end
 
-function caps = buildCapsulesAtConfig(robot, q, bodyNames, radMap)
+function caps = buildCapsulesAtConfig(robot,q,bodyNames,radMap)
 caps = struct('p0',{},'p1',{},'mid',{},'halfLen',{},'r',{},'name',{});
 for i = 1:numel(bodyNames)
-    bName = bodyNames{i};
-    body = getBody(robot, bName);
-    if isempty(body.Parent)
-        continue;
-    end
-    pName = char(body.Parent.Name);
-
-    T0 = getTransform(robot, q, pName);
-    T1 = getTransform(robot, q, bName);
-
+    bn = bodyNames{i};
+    b = getBody(robot,bn);
+    if isempty(b.Parent), continue; end
+    pn = char(b.Parent.Name);
+    T0 = getTransform(robot,q,pn);
+    T1 = getTransform(robot,q,bn);
     p0 = T0(1:3,4).';
     p1 = T1(1:3,4).';
-    segLen = norm(p1-p0);
-    if segLen < 1e-7
-        continue;
-    end
+    L = norm(p1-p0);
+    if L < 1e-7, continue; end
 
     caps(end+1).p0 = p0; %#ok<AGROW>
     caps(end).p1 = p1;
     caps(end).mid = 0.5*(p0+p1);
-    caps(end).halfLen = 0.5*segLen;
-    caps(end).r = getRadiusForBody(radMap, bName);
-    caps(end).name = sprintf("%s->%s", pName, bName);
+    caps(end).halfLen = 0.5*L;
+    caps(end).r = getRadiusForBody(radMap,bn);
+    caps(end).name = sprintf("%s->%s", pn, bn);
 end
 end
 
-function d = segmentSegmentDistance(P0, P1, Q0, Q1)
-u = P1 - P0;
-v = Q1 - Q0;
-w = P0 - Q0;
-a = dot(u,u);
-b = dot(u,v);
-c = dot(v,v);
-d0 = dot(u,w);
-e = dot(v,w);
-D = a*c - b*b;
-SMALL = 1e-12;
+function d = segmentSegmentDistance(P0,P1,Q0,Q1)
+u = P1-P0; v = Q1-Q0; w = P0-Q0;
+a=dot(u,u); b=dot(u,v); c=dot(v,v); d0=dot(u,w); e=dot(v,w);
+D=a*c-b*b; SMALL=1e-12;
 
-sN = 0; sD = D;
-tN = 0; tD = D;
-
+sN=0; sD=D; tN=0; tD=D;
 if D < SMALL
-    sN = 0; sD = 1;
-    tN = e; tD = c;
+    sN=0; sD=1; tN=e; tD=c;
 else
-    sN = (b*e - c*d0);
-    tN = (a*e - b*d0);
+    sN=(b*e-c*d0); tN=(a*e-b*d0);
     if sN < 0
-        sN = 0; tN = e; tD = c;
+        sN=0; tN=e; tD=c;
     elseif sN > sD
-        sN = sD; tN = e + b; tD = c;
+        sN=sD; tN=e+b; tD=c;
     end
 end
 
 if tN < 0
-    tN = 0;
+    tN=0;
     if -d0 < 0
-        sN = 0;
+        sN=0;
     elseif -d0 > a
-        sN = sD;
+        sN=sD;
     else
-        sN = -d0; sD = a;
+        sN=-d0; sD=a;
     end
 elseif tN > tD
-    tN = tD;
-    if (-d0 + b) < 0
-        sN = 0;
-    elseif (-d0 + b) > a
-        sN = sD;
+    tN=tD;
+    if (-d0+b) < 0
+        sN=0;
+    elseif (-d0+b) > a
+        sN=sD;
     else
-        sN = (-d0 + b); sD = a;
+        sN=(-d0+b); sD=a;
     end
 end
 
-if abs(sN) < SMALL, sc = 0; else, sc = sN/sD; end
-if abs(tN) < SMALL, tc = 0; else, tc = tN/tD; end
+if abs(sN) < SMALL, sc=0; else, sc=sN/sD; end
+if abs(tN) < SMALL, tc=0; else, tc=tN/tD; end
 
 dP = w + sc*u - tc*v;
 d = norm(dP);
+end
+
+function [p1,p2] = clampInsideEllipsoid(p1,p2,c0,abc,scale)
+a=abc(1); b=abc(2); c=abc(3);
+p1 = project(p1);
+p2 = project(p2);
+
+    function P = project(P)
+        X = (P(:,1)-c0(1))/a;
+        Y = (P(:,2)-c0(2))/b;
+        Z = (P(:,3)-c0(3))/c;
+        r2 = X.^2+Y.^2+Z.^2;
+        idx = r2 > scale^2;
+        if any(idx)
+            s = sqrt(r2(idx))/scale;
+            X(idx)=X(idx)./s; Y(idx)=Y(idx)./s; Z(idx)=Z(idx)./s;
+            P(idx,1)=c0(1)+a*X(idx);
+            P(idx,2)=c0(2)+b*Y(idx);
+            P(idx,3)=c0(3)+c*Z(idx);
+        end
+    end
+end
+
+function p = samplePointInEllipsoid(center,abc,scale)
+a=abc(1)*scale; b=abc(2)*scale; c=abc(3)*scale;
+while true
+    x=(2*rand()-1)*a; y=(2*rand()-1)*b; z=(2*rand()-1)*c;
+    if (x/a)^2 + (y/b)^2 + (z/c)^2 <= 1
+        p = center + [x y z];
+        return;
+    end
+end
+end
+
+function qn = perturbSeed(q,sigma)
+qn = q + sigma*(2*rand(size(q))-1);
+end
+
+function [robotL,robotR] = placeDualRobots(robotRaw, baseL, baseR)
+TL = trvec2tform(baseL);
+TR = trvec2tform(baseR);
+robotL = makePlacedRobot(robotRaw, TL);
+robotR = makePlacedRobot(robotRaw, TR);
+end
+
+function eeName = resolveEEName(robot, eeRaw)
+if any(strcmp(robot.BodyNames, eeRaw))
+    eeName = eeRaw;
+else
+    eeName = robot.BodyNames{end};
+end
+end
+
+function ik = makeIKBackend(robot)
+ik = struct();
+if exist('inverseKinematics','class') > 0
+    ik.Mode = "inverseKinematics";
+    ik.Obj = inverseKinematics("RigidBodyTree", robot);
+else
+    ik.Mode = "numericFallback";
+    ik.Obj = [];
+end
 end
 
 function [shoulderBody, elbowBody] = pickShoulderElbowBodies(robot)
 names = string(robot.BodyNames);
 shoulderCandidates = ["link2","link_2","shoulder","upperarm","upper_arm"];
 elbowCandidates = ["link3","link_3","elbow","forearm","lowerarm","lower_arm"];
-
-shoulderBody = ""; elbowBody = "";
-
+shoulderBody=""; elbowBody="";
 for c = shoulderCandidates
-    idx = find(contains(lower(names), lower(c)), 1, "first");
+    idx = find(contains(lower(names), lower(c)),1,'first');
     if ~isempty(idx), shoulderBody = names(idx); break; end
 end
 for c = elbowCandidates
-    idx = find(contains(lower(names), lower(c)), 1, "first");
+    idx = find(contains(lower(names), lower(c)),1,'first');
     if ~isempty(idx), elbowBody = names(idx); break; end
 end
-
-if shoulderBody == "", shoulderBody = names(min(2,numel(names))); end
-if elbowBody == "", elbowBody = names(min(3,numel(names))); end
-
+if shoulderBody=="", shoulderBody = names(min(2,numel(names))); end
+if elbowBody=="", elbowBody = names(min(3,numel(names))); end
 shoulderBody = char(shoulderBody);
 elbowBody = char(elbowBody);
 end
 
 function armBodies = pickArmBodies(robot)
-names = string(robot.BodyNames);
-ln = lower(names);
-keep = contains(ln, "link") | contains(ln,"shoulder") | contains(ln,"arm") | contains(ln,"elbow") | ...
-       contains(ln,"fore") | contains(ln,"wrist") | contains(ln,"hand") | contains(ln,"tool") | contains(ln,"flange") | contains(ln,"ee");
-keep = keep & ~contains(ln, "world_base");
+n = string(robot.BodyNames);
+ln = lower(n);
+keep = contains(ln,"link") | contains(ln,"shoulder") | contains(ln,"arm") | contains(ln,"elbow") | ...
+       contains(ln,"fore") | contains(ln,"wrist") | contains(ln,"hand") | contains(ln,"tool") | contains(ln,"ee") | contains(ln,"flange");
+keep = keep & ~contains(ln,"world_base");
 if nnz(keep) < 2
-    keep = true(size(names));
+    keep = true(size(n));
     keep(1) = false;
 end
-armBodies = cellstr(names(keep));
+armBodies = cellstr(n(keep));
 end
 
 function radMap = buildArmCapsuleRadiusMap(bodyNames)
 radMap = containers.Map('KeyType','char','ValueType','double');
 for i = 1:numel(bodyNames)
-    name = lower(string(bodyNames{i}));
+    s = lower(string(bodyNames{i}));
     r = 0.050;
-    if contains(name, "link1") || contains(name,"link2") || contains(name,"shoulder") || contains(name,"upper")
+    if contains(s,"link1") || contains(s,"link2") || contains(s,"upper") || contains(s,"shoulder")
         r = 0.056;
-    elseif contains(name, "link3") || contains(name,"link4") || contains(name,"elbow") || contains(name,"fore")
-        r = 0.050;
-    elseif contains(name, "link5") || contains(name,"link6") || contains(name,"wrist") || contains(name,"hand") || contains(name,"tool")
+    elseif contains(s,"link5") || contains(s,"link6") || contains(s,"wrist") || contains(s,"hand") || contains(s,"tool")
         r = 0.042;
     end
     radMap(char(bodyNames{i})) = r;
@@ -901,9 +867,9 @@ else
 end
 end
 
-function plotEllipsoid(ax, c0, a, b, c)
-[xe, ye, ze] = ellipsoid(c0(1), c0(2), c0(3), a, b, c, 30);
-s = surf(ax, xe, ye, ze);
+function plotEllipsoid(ax,c0,a,b,c)
+[xe,ye,ze] = ellipsoid(c0(1),c0(2),c0(3),a,b,c,30);
+s = surf(ax,xe,ye,ze);
 s.EdgeAlpha = 0.15;
 s.FaceAlpha = 0.05;
 s.FaceColor = [0.2 0.7 0.2];
@@ -936,7 +902,7 @@ robot.DataFormat = "row";
 bodies = string(robot.BodyNames);
 parents = strings(0);
 for i = 1:numel(bodies)
-    b = getBody(robot, bodies(i));
+    b = getBody(robot,bodies(i));
     if ~isempty(b.Parent)
         parents(end+1) = string(b.Parent.Name); %#ok<AGROW>
     end
@@ -962,12 +928,12 @@ nameMap = containers.Map('KeyType','char','ValueType','char');
 
     function newName = uniqueName(oldName)
         newName = oldName;
-        if isKey(used, newName)
-            k = 1;
-            while isKey(used, sprintf("%s_%d", oldName, k))
+        if isKey(used,newName)
+            k=1;
+            while isKey(used,sprintf("%s_%d",oldName,k))
                 k = k + 1;
             end
-            newName = sprintf("%s_%d", oldName, k);
+            newName = sprintf("%s_%d",oldName,k);
         end
         used(newName) = true;
     end
@@ -993,14 +959,13 @@ for i = 1:numel(robotRaw.Bodies)
 end
 end
 
-
-function f = positionOnlyObjective(robot, q, eeName, pGoal)
-T = getTransform(robot, q, eeName);
-f = norm(T(1:3,4).' - pGoal, 2);
+function f = positionOnlyObjective(robot,q,eeName,pGoal)
+T = getTransform(robot,q,eeName);
+f = norm(T(1:3,4).'-pGoal,2);
 end
 
-function v = getOpt(opts, key, defaultVal)
-if isfield(opts, key)
+function v = getOpt(opts,key,defaultVal)
+if isfield(opts,key)
     v = opts.(key);
 else
     v = defaultVal;
