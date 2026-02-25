@@ -29,7 +29,7 @@ baseYawDegR  = getOpt(opts, 'BaseYawDegR', 0);
 
 % Forward / workspace defaults (belly-front region)
 forwardOffset = getOpt(opts, 'ForwardOffset', 0.50);
-workspaceZ    = getOpt(opts, 'WorkspaceZ', 0.55);
+workspaceZRel = getOpt(opts, 'WorkspaceZRel', -0.40);
 xKeep         = getOpt(opts, 'XKeep', 0.09);
 
 % Capsule margin diagnostics
@@ -65,12 +65,14 @@ qMaxL = extractJointMaxs(robotL, qHome);
 qMinR = extractJointMins(robotR, qHome);
 qMaxR = extractJointMaxs(robotR, qHome);
 
-%% Workspace center selection (forward constraint + auto-correct)
+%% Workspace center selection (forward + below-shoulder constraints)
 userCenter = getOpt(opts, 'WorkspaceCenter', []);
+baseZRef = 0.5*(baseLeftXYZ(3) + baseRightXYZ(3));
 if isempty(userCenter)
     centerX = 0.0;
     centerY = max(baseLeftXYZ(2), baseRightXYZ(2)) + forwardOffset;
-    center  = [centerX, centerY, workspaceZ];
+    centerZ = baseZRef + workspaceZRel;
+    center  = [centerX, centerY, centerZ];
 else
     center = userCenter;
 end
@@ -82,6 +84,16 @@ if center(2) < forwardMinY
     end
     center(2) = forwardMinY;
 end
+
+% Shoulder-reference Z rule: workspace below shoulder (base) and below 0 by default semantics
+zMaxAllowed = min(baseZRef + workspaceZRel, -1e-3);
+if center(3) >= zMaxAllowed
+    if verbose
+        fprintf('[dual_static_setup_view] user/proposed workspaceCenter adjusted for below-shoulder constraint: z %.3f -> %.3f\n', center(3), zMaxAllowed);
+    end
+    center(3) = zMaxAllowed;
+end
+
 % Keep centered in x for symmetric "dual-arm" setup
 center(1) = 0.0;
 forwardOk = center(2) >= forwardMinY;
@@ -112,7 +124,7 @@ capsulesR = buildCapsulesAtConfig(robotR, qWorkR, armBodiesR, radMapR);
 %% Console logs (required)
 if verbose
     fprintf('\n[dual_static_setup_view] baseL=(%.3f %.3f %.3f), baseR=(%.3f %.3f %.3f)\n', baseLeftXYZ, baseRightXYZ);
-    fprintf('[dual_static_setup_view] baseYawDeg L/R=(%.1f, %.1f), forwardOffset=%.3f\n', baseYawDegL, baseYawDegR, forwardOffset);
+    fprintf('[dual_static_setup_view] baseYawDeg L/R=(%.1f, %.1f), forwardOffset=%.3f, WorkspaceZRel=%.3f\n', baseYawDegL, baseYawDegR, forwardOffset, workspaceZRel);
     fprintf('[dual_static_setup_view] workspaceCenter=(%.3f %.3f %.3f), workspaceSize=[%.3f %.3f %.3f], forwardOk=%d\n', ...
         center, workspaceSize, forwardOk);
     fprintf('[dual_static_setup_view] EE name=%s\n', eeName);
@@ -131,6 +143,7 @@ xlabel(ax,'X [m]'); ylabel(ax,'Y [m]'); zlabel(ax,'Z [m]');
 title(ax,'Dual Static Setup: Work Posture + Forward Workspace + Capsule Ranges');
 
 plotEllipsoid(ax, center, workspaceSize(1), workspaceSize(2), workspaceSize(3));
+plot3(ax, [-1 1], [0 0], [0 0], ':', 'Color', [0.25 0.25 0.25], 'LineWidth', 1.0);
 
 show(robotL, qWorkL, 'Parent', ax, 'PreservePlot', true, 'Visuals','on', 'Frames','off');
 show(robotR, qWorkR, 'Parent', ax, 'PreservePlot', true, 'Visuals','on', 'Frames','off');
@@ -143,14 +156,20 @@ plot3(ax, goalR(1),goalR(2),goalR(3),'o','Color',[0.9 0.2 0.2],'MarkerFaceColor'
 plot3(ax, baseLeftXYZ(1),baseLeftXYZ(2),baseLeftXYZ(3),'s','Color',[0 0 0.7],'MarkerFaceColor',[0 0 0.7]);
 plot3(ax, baseRightXYZ(1),baseRightXYZ(2),baseRightXYZ(3),'s','Color',[0.7 0 0],'MarkerFaceColor',[0.7 0 0]);
 
-% Capsules: segment lines + sample radius labels
+% Capsules: per-link center lines + margin envelope lines
 for i = 1:numel(capsulesL)
     c = capsulesL(i);
-    plot3(ax,[c.p0(1) c.p1(1)],[c.p0(2) c.p1(2)],[c.p0(3) c.p1(3)],'-','Color',[0.1 0.35 0.95],'LineWidth',1.5);
+    lwCore = max(1.2, 65*c.r);
+    lwOut  = max(1.8, 65*(c.r + collisionMargin));
+    plot3(ax,[c.p0(1) c.p1(1)],[c.p0(2) c.p1(2)],[c.p0(3) c.p1(3)],'-','Color',[0.55 0.75 1.0],'LineWidth',lwOut);
+    plot3(ax,[c.p0(1) c.p1(1)],[c.p0(2) c.p1(2)],[c.p0(3) c.p1(3)],'-','Color',[0.1 0.35 0.95],'LineWidth',lwCore);
 end
 for i = 1:numel(capsulesR)
     c = capsulesR(i);
-    plot3(ax,[c.p0(1) c.p1(1)],[c.p0(2) c.p1(2)],[c.p0(3) c.p1(3)],'-','Color',[0.95 0.2 0.2],'LineWidth',1.5);
+    lwCore = max(1.2, 65*c.r);
+    lwOut  = max(1.8, 65*(c.r + collisionMargin));
+    plot3(ax,[c.p0(1) c.p1(1)],[c.p0(2) c.p1(2)],[c.p0(3) c.p1(3)],'-','Color',[1.0 0.75 0.75],'LineWidth',lwOut);
+    plot3(ax,[c.p0(1) c.p1(1)],[c.p0(2) c.p1(2)],[c.p0(3) c.p1(3)],'-','Color',[0.95 0.2 0.2],'LineWidth',lwCore);
 end
 
 for i = 1:min(3,numel(capsulesL))
@@ -167,12 +186,12 @@ if ~isempty(capsulesL) && ~isempty(capsulesR)
     exL = capsulesL(1); exR = capsulesR(1);
     narrowTh = exL.r + exR.r + collisionMargin;
     broadTh = narrowTh + broadMargin;
-    thTxt = sprintf('Example pair threshold:\n narrow = %.4f + %.4f + %.4f = %.4f\n broad skip = %.4f + %.4f = %.4f', ...
+    thTxt = sprintf(['Example pair threshold:\n',' narrow: d < rL + rR + collisionMargin\n',' values: %.4f + %.4f + %.4f = %.4f\n',' broad skip: narrow + broadMargin = %.4f + %.4f = %.4f\n',' Base is shoulder reference (z=0), workspace is below shoulder.'], ...
         exL.r, exR.r, collisionMargin, narrowTh, narrowTh, broadMargin, broadTh);
     text(ax, center(1), center(2)-workspaceSize(2)-0.22, center(3)+workspaceSize(3)+0.15, thTxt, 'BackgroundColor','w', 'FontSize',8);
 end
 
-legend(ax, {'Workspace (fixed size)','Goal L','Goal R','Base L','Base R','Left capsule segments','Right capsule segments'}, ...
+legend(ax, {'Workspace ellipsoid (fixed size)','Goal L','Goal R','Base L (shoulder ref)','Base R (shoulder ref)','Left capsules (core+margin)','Right capsules (core+margin)'}, ...
     'Location','bestoutside');
 
 % Auto-limits include bases + workspace + goals + capsule endpoints
