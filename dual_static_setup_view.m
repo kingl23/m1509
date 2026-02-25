@@ -29,7 +29,9 @@ baseYawDegR  = getOpt(opts, 'BaseYawDegR', 0);
 
 % Forward / workspace defaults (belly-front region)
 forwardOffset = getOpt(opts, 'ForwardOffset', 0.50);
-workspaceZRel = getOpt(opts, 'WorkspaceZRel', -0.40);
+workspaceZRelDefault    = getOpt(opts, 'WorkspaceZRelDefault', -0.30);
+workspaceZRelScanEnabled = getOpt(opts, 'WorkspaceZRelScanEnabled', true);
+workspaceZRelScanList    = getOpt(opts, 'WorkspaceZRelScanList', [-0.20 -0.25 -0.30 -0.35 -0.40 -0.45 -0.50]);
 xKeep         = getOpt(opts, 'XKeep', 0.09);
 
 % Capsule margin diagnostics
@@ -65,35 +67,97 @@ qMaxL = extractJointMaxs(robotL, qHome);
 qMinR = extractJointMins(robotR, qHome);
 qMaxR = extractJointMaxs(robotR, qHome);
 
+forwardMinY = max(baseLeftXYZ(2), baseRightXYZ(2)) + forwardOffset;
+
 %% Workspace center selection (shoulder-frame belly-front semantics)
 userCenter = getOpt(opts, 'WorkspaceCenter', []);
 workspaceX = mean([baseLeftXYZ(1), baseRightXYZ(1)]);
 if isempty(userCenter)
-    workspaceCenter = [workspaceX, forwardOffset, workspaceZRel];
+    workspaceCenter = [workspaceX, forwardMinY, workspaceZRelDefault];
 else
     workspaceCenter = userCenter;
     workspaceCenter(1) = workspaceX;
-    workspaceCenter(2) = forwardOffset;
-    workspaceCenter(3) = workspaceZRel;
+    if workspaceCenter(2) < forwardMinY && verbose
+        fprintf('[dual_static_setup_view] userCenter adjusted to satisfy forward constraint: y %.3f -> %.3f\n', workspaceCenter(2), forwardMinY);
+    end
+    workspaceCenter(2) = forwardMinY;
+    workspaceCenter(3) = userCenter(3);
 end
 
+% enforce required semantics: belly-front and below shoulder
+workspaceCenter(2) = max(workspaceCenter(2), forwardMinY);
+if workspaceCenter(3) >= 0
+    if verbose
+        fprintf('[dual_static_setup_view] userCenter.z=%.3f is invalid (must be <0); forcing WorkspaceZRelDefault=%.3f\n', workspaceCenter(3), workspaceZRelDefault);
+    end
+    workspaceCenter(3) = workspaceZRelDefault;
+end
 assert(workspaceCenter(3) < 0, 'Workspace Z must be below shoulder (Z<0).');
 forwardOk = workspaceCenter(2) > max(baseLeftXYZ(2), baseRightXYZ(2));
 
 %% Work posture IK goals near center (slight left/right split)
-goalL = workspaceCenter + [-xKeep, 0, 0];
-goalR = workspaceCenter + [+xKeep, 0, 0];
+goalLiftZ = 0.05;
+dx = min(0.15, max(0.06, xKeep));
 
-[qWorkL, repL] = solveWorkIK(robotL, eeName, qHome, goalL, shoulderL, elbowL, -1, qMinL, qMaxL, wPos, wElbow, wJDist);
-[qWorkR, repR] = solveWorkIK(robotR, eeName, qHome, goalR, shoulderR, elbowR, +1, qMinR, qMaxR, wPos, wElbow, wJDist);
+if workspaceZRelScanEnabled
+    zList = workspaceZRelScanList;
+else
+    zList = workspaceCenter(3);
+end
+
+bestScore = inf;
+best = struct();
+for zi = 1:numel(zList)
+    cTry = [workspaceX, forwardMinY, zList(zi)];
+    if cTry(3) >= 0
+        continue;
+    end
+
+    gL = projectInsideEllipsoid(cTry + [-dx, 0.00, goalLiftZ], cTry, workspaceSize, 0.95);
+    gR = projectInsideEllipsoid(cTry + [+dx, 0.00, goalLiftZ], cTry, workspaceSize, 0.95);
+
+    repLTry = solveStaticIKMultiSeed(robotL, eeName, gL, qHome, qMinL, qMaxL, shoulderL, elbowL, -1, wPos, wElbow, wJDist);
+    repRTry = solveStaticIKMultiSeed(robotR, eeName, gR, qHome, qMinR, qMaxR, shoulderR, elbowR, +1, wPos, wElbow, wJDist);
+
+    score = (repLTry.posErr + repRTry.posErr) + 0.2*max(repLTry.posErr, repRTry.posErr);
+    pass = (repLTry.posErr < 0.08) && (repRTry.posErr < 0.08);
+
+    if pass && score < bestScore
+        bestScore = score;
+        best.center = cTry;
+        best.goalL = gL;
+        best.goalR = gR;
+        best.repL = repLTry;
+        best.repR = repRTry;
+    end
+end
+
+if isfinite(bestScore)
+    workspaceCenter = best.center;
+    goalL = best.goalL;
+    goalR = best.goalR;
+    repL = best.repL;
+    repR = best.repR;
+    qWorkL = repL.q;
+    qWorkR = repR.q;
+    chosenWorkspaceZRel = workspaceCenter(3);
+else
+    warning('[dual_static_setup_view] WorkspaceZRel scan found no dual-pass candidate. Falling back to default zRel=%.3f.', workspaceZRelDefault);
+    workspaceCenter = [workspaceX, forwardMinY, workspaceZRelDefault];
+    goalL = projectInsideEllipsoid(workspaceCenter + [-dx, 0.00, goalLiftZ], workspaceCenter, workspaceSize, 0.95);
+    goalR = projectInsideEllipsoid(workspaceCenter + [+dx, 0.00, goalLiftZ], workspaceCenter, workspaceSize, 0.95);
+    repL = solveStaticIKMultiSeed(robotL, eeName, goalL, qHome, qMinL, qMaxL, shoulderL, elbowL, -1, wPos, wElbow, wJDist);
+    repR = solveStaticIKMultiSeed(robotR, eeName, goalR, qHome, qMinR, qMaxR, shoulderR, elbowR, +1, wPos, wElbow, wJDist);
+    qWorkL = repL.q;
+    qWorkR = repR.q;
+    chosenWorkspaceZRel = workspaceCenter(3);
+end
 
 if ~repL.ok
-    warning('[dual_static_setup_view] Left IK failed at static setup (posErr=%.4f, exitFlag=%d). Using qHome.', repL.posErr, repL.exitFlag);
-    qWorkL = qHome;
+    warning('[dual_static_setup_view] Left IK failed at static setup (posErr=%.4f, exitFlag=%d). Using best candidate.', repL.posErr, repL.exitFlag);
 end
 if ~repR.ok
-    warning('[dual_static_setup_view] Right IK failed at static setup (posErr=%.4f, exitFlag=%d). Using qHome.', repR.posErr, repR.exitFlag);
-    qWorkR = qHome;
+    warning('[dual_static_setup_view] Right IK failed at static setup (posErr=%.4f, exitFlag=%d). Using best candidate.', repR.posErr, repR.exitFlag);
 end
 
 %% Capsule proxies at work posture
@@ -108,7 +172,7 @@ capsulesR = buildCapsulesAtConfig(robotR, qWorkR, armBodiesR, radMapR);
 %% Console logs (required)
 if verbose
     fprintf('\n[dual_static_setup_view] baseL=(%.3f %.3f %.3f), baseR=(%.3f %.3f %.3f)\n', baseLeftXYZ, baseRightXYZ);
-    fprintf('[dual_static_setup_view] baseYawDeg L/R=(%.1f, %.1f), forwardOffset=%.3f, WorkspaceZRel=%.3f\n', baseYawDegL, baseYawDegR, forwardOffset, workspaceZRel);
+    fprintf('[dual_static_setup_view] baseYawDeg L/R=(%.1f, %.1f), forwardOffset=%.3f, forwardMinY=%.3f, chosenWorkspaceZRel=%.3f\n', baseYawDegL, baseYawDegR, forwardOffset, forwardMinY, chosenWorkspaceZRel);
     fprintf('[dual_static_setup_view] workspaceCenter=(%.3f %.3f %.3f), workspaceSize=[%.3f %.3f %.3f], forwardOk=%d\n', ...
         workspaceCenter, workspaceSize, forwardOk);
     fprintf('[dual_static_setup_view] EE name=%s\n', eeName);
@@ -182,7 +246,7 @@ legend(ax, {'Workspace ellipsoid (fixed size)','Goal L','Goal R','Base L (should
 
 % Auto-limits include bases + workspace + goals + capsule endpoints
 lims = computeStaticLimits(baseLeftXYZ, baseRightXYZ, workspaceCenter, workspaceSize, goalL, goalR, capsulesL, capsulesR);
-xlim(ax, lims(1,:)); ylim(ax, lims(2,:)); zlim(ax, [workspaceZRel - 0.3, 1.2]);
+xlim(ax, lims(1,:)); ylim(ax, lims(2,:)); zlim(ax, [min(-0.70, workspaceCenter(3)-0.35), 1.2]);
 
 %% Output struct
 out = struct();
@@ -210,7 +274,7 @@ end
 
 %% --------------------------- local helpers ---------------------------
 
-function [qBest, report] = solveWorkIK(robot, eeName, qHome, pGoal, shoulderBody, elbowBody, sideSign, qMin, qMax, wPos, wElbow, wJDist)
+function report = solveStaticIKMultiSeed(robot, eeName, pGoal, qHome, qMin, qMax, shoulderBody, elbowBody, sideSign, wPos, wElbow, wJDist)
 ik = inverseKinematics('RigidBodyTree', robot);
 Tgoal = [eye(3), pGoal(:); 0 0 0 1];
 weights = [1 1 1 0.001 0.001 0.001]; % position-dominant
@@ -222,7 +286,7 @@ seeds = {
 
 bestScore = inf;
 qBest = qHome;
-report = struct('ok',false,'posErr',inf,'elbowOutMetric',nan,'clampUsed',false,'exitFlag',-999,'score',inf);
+report = struct('ok',false,'posErr',inf,'elbowOutMetric',nan,'clampUsed',false,'exitFlag',-999,'score',inf,'q',qHome);
 
 for i = 1:numel(seeds)
     q0 = clampToLimits(seeds{i}, qMin, qMax);
@@ -250,6 +314,7 @@ for i = 1:numel(seeds)
         report.clampUsed = wasClamped;
         report.exitFlag = exitFlag;
         report.score = score;
+        report.q = qCand2;
     end
 end
 end
@@ -280,10 +345,12 @@ if isempty(shoulderBody) || isempty(elbowBody)
     eOut = 0;
     return;
 end
-Tsh = getTransform(robot, q, shoulderBody);
 Tel = getTransform(robot, q, elbowBody);
-d = Tel(1:3,4) - Tsh(1:3,4);
-eOut = sideSign * d(1);
+if sideSign < 0
+    eOut = -Tel(1,4);
+else
+    eOut = +Tel(1,4);
+end
 end
 
 function q = clampToLimits(q, qMin, qMax)
@@ -339,7 +406,21 @@ mx = max(pts,[],1);
 pad = [0.20 0.25 0.20];
 lims = [mn(1)-pad(1), mx(1)+pad(1); ...
         mn(2)-pad(2), mx(2)+pad(2); ...
-        max(0,mn(3)-pad(3)), mx(3)+pad(3)];
+        mn(3)-pad(3), mx(3)+pad(3)];
+end
+
+
+function p = projectInsideEllipsoid(p, c0, abc, scale)
+a = abc(1); b = abc(2); c = abc(3);
+X = (p(1)-c0(1))/a;
+Y = (p(2)-c0(2))/b;
+Z = (p(3)-c0(3))/c;
+r2 = X^2 + Y^2 + Z^2;
+if r2 > scale^2
+    s = sqrt(r2)/scale;
+    X = X/s; Y = Y/s; Z = Z/s;
+    p = [c0(1)+a*X, c0(2)+b*Y, c0(3)+c*Z];
+end
 end
 
 function ee = chooseEENameCommon(robotL, robotR, opts, eeAuto)
